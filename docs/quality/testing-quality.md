@@ -13,6 +13,8 @@ The first test suite covers:
 - Privileged state writes preserve authorized-user ownership and permissions.
 - Privileged state writes reject symlinked state directories and invalid root
   authorization identities.
+- Managed Mihomo downloads discover and rank assets from GitHub's dynamic
+  expanded-assets listing and only fall back after HTTP 404 responses.
 - CLI argument parsing, JSON envelope stability, color/log rendering rules, and
   npm-style help behavior.
 

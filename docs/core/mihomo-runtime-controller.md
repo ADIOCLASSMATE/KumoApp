@@ -8,6 +8,17 @@ Kumo manages a Mihomo core executable. The core can come from:
 - The `KUMO_MIHOMO_PATH` environment variable.
 - A bundled `mihomo` resource.
 - Common Homebrew or system paths.
+- A managed download from MetaCubeX/mihomo GitHub Releases.
+
+Managed downloads use the public GitHub releases Atom feed to discover the
+latest stable `v*` tag, then read GitHub's public expanded-assets page and
+select matching macOS `.gz` assets from the names GitHub actually lists.
+Kumo prefers the plain architecture build and ranks listed variants as
+fallbacks without maintaining a fixed Go-version or CPU-variant filename
+table. Only an HTTP 404 advances to another listed asset; cancellation,
+network, server, and filesystem errors fail immediately. This avoids depending
+on the GitHub REST API release endpoint, whose unauthenticated quota can return
+HTTP 403 even when the browser-accessible release asset is available.
 
 The current implementation starts Mihomo with a generated work directory. The generated `config.yaml` contains Kumo-controlled controller and proxy settings, and the supervisor also passes the controller endpoint with Mihomo's `-ext-ctl` flag plus `-secret` when a secret is configured. This keeps the UI and CLI controller surface reachable even when a profile or Mihomo build treats controller YAML differently from listener settings.
 
