@@ -108,8 +108,12 @@ public struct SystemProxyController: Sendable {
     private let pacServer: PACServer
     private let commandRunner: SystemProxyCommandRunner
 
-    public init(paths: KumoPaths = KumoPaths(), commandRunner: SystemProxyCommandRunner = .live) {
-        self.stateStore = CoreStateStore(paths: paths)
+    public init(
+        paths: KumoPaths = KumoPaths(),
+        commandRunner: SystemProxyCommandRunner = .live,
+        stateFileOwnership: StateFileOwnership? = nil
+    ) {
+        self.stateStore = CoreStateStore(paths: paths, ownership: stateFileOwnership)
         self.pacServer = PACServer()
         self.commandRunner = commandRunner
     }

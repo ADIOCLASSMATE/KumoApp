@@ -166,6 +166,16 @@ uninstalling the helper. Stopping Mihomo is the cleanup boundary for the active
 TUN route and Mihomo-managed DNS interception; the user's persisted TUN
 preference remains available for the next explicit start.
 
+The helper requires a valid non-root installing-user UID and resolves its
+primary GID without falling back to the daemon's root identity. Privileged
+`state.json` writes pin the authorized-user-owned destination directory with a
+file descriptor, stage a root-owned file in a root-owned protected or sticky
+temporary directory, atomically replace the destination with `renameat`, then apply
+authorized-user ownership and user-only permissions through the still-open
+file descriptor. Symlinked or foreign-owned state directories are rejected.
+This prevents path-replacement races while keeping the GUI and CLI able to
+read and update state after helper-owned core, TUN, or system proxy operations.
+
 ## Advanced Features
 
 The following remain hardening work after the first service-backed path:

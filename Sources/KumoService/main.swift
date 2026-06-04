@@ -45,9 +45,11 @@ enum KumoServiceMain {
               let sharedSecret = value(after: "--shared-secret", in: arguments) else {
             throw KumoError.invalidArguments("Usage: KumoService service install --source <path> --app-support <path> --authorized-uid <uid> --key-id <id> --shared-secret <secret>")
         }
+        let authorizedUser = try StateFileOwnership.authorizedUser(userID: authorizedUID)
 
         let paths = KumoPaths(applicationSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
         try paths.prepare()
+        try setDirectoryOwner(paths.applicationSupportDirectory, ownership: authorizedUser)
         try FileManager.default.createDirectory(
             at: paths.serviceExecutableFile.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -59,20 +61,38 @@ enum KumoServiceMain {
         if source != paths.serviceExecutableFile.path {
             try FileManager.default.copyItem(at: URL(fileURLWithPath: source), to: paths.serviceExecutableFile)
         }
-        chmod(paths.serviceExecutableFile.path, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)
-        chown(paths.serviceExecutableFile.path, 0, 0)
+        try checkPOSIX(
+            chmod(paths.serviceExecutableFile.path, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH),
+            operation: "set service executable permissions"
+        )
+        try checkPOSIX(
+            chown(paths.serviceExecutableFile.path, 0, 0),
+            operation: "set service executable owner"
+        )
 
         let credentials = KumoServiceCredentials(keyID: keyID, sharedSecret: sharedSecret)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(credentials).write(to: paths.serviceCredentialsFile, options: .atomic)
-        chown(paths.serviceCredentialsFile.path, authorizedUID, getgid())
-        chmod(paths.serviceCredentialsFile.path, S_IRUSR | S_IWUSR)
+        try checkPOSIX(
+            chown(paths.serviceCredentialsFile.path, authorizedUser.userID, authorizedUser.groupID),
+            operation: "set service credentials owner"
+        )
+        try checkPOSIX(
+            chmod(paths.serviceCredentialsFile.path, S_IRUSR | S_IWUSR),
+            operation: "set service credentials permissions"
+        )
 
         let plist = launchDaemonPlist(paths: paths, authorizedUID: authorizedUID)
         try plist.write(to: paths.serviceLaunchDaemonPlistFile, atomically: true, encoding: .utf8)
-        chown(paths.serviceLaunchDaemonPlistFile.path, 0, 0)
-        chmod(paths.serviceLaunchDaemonPlistFile.path, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        try checkPOSIX(
+            chown(paths.serviceLaunchDaemonPlistFile.path, 0, 0),
+            operation: "set launch daemon owner"
+        )
+        try checkPOSIX(
+            chmod(paths.serviceLaunchDaemonPlistFile.path, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH),
+            operation: "set launch daemon permissions"
+        )
 
         _ = try? runCommand("/bin/launchctl", ["bootout", "system/\(KumoServiceManager.launchDaemonLabel)"])
         try runCommand("/bin/launchctl", ["bootstrap", "system", paths.serviceLaunchDaemonPlistFile.path])
@@ -111,11 +131,14 @@ enum KumoServiceMain {
         guard let appSupport = value(after: "--app-support", in: arguments) else {
             throw KumoError.invalidArguments("KumoService service run requires --app-support <path>.")
         }
-        let authorizedUID = value(after: "--authorized-uid", in: arguments).flatMap(uid_t.init) ?? getuid()
+        guard let authorizedUID = value(after: "--authorized-uid", in: arguments).flatMap(uid_t.init) else {
+            throw KumoError.invalidArguments("KumoService service run requires a valid --authorized-uid <uid>.")
+        }
+        let authorizedUser = try StateFileOwnership.authorizedUser(userID: authorizedUID)
         let paths = KumoPaths(applicationSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
         try paths.prepare()
         let credentials = try KumoServiceManager(paths: paths).loadCredentials()
-        let server = KumoServiceSocketServer(paths: paths, credentials: credentials, authorizedUID: authorizedUID)
+        let server = KumoServiceSocketServer(paths: paths, credentials: credentials, authorizedUser: authorizedUser)
         try await server.run()
     }
 
@@ -192,13 +215,13 @@ enum KumoServiceMain {
 private final class KumoServiceSocketServer: @unchecked Sendable {
     private let paths: KumoPaths
     private let credentials: KumoServiceCredentials
-    private let authorizedUID: uid_t
+    private let authorizedUser: StateFileOwnership
     private var seenNonces = Set<String>()
 
-    init(paths: KumoPaths, credentials: KumoServiceCredentials, authorizedUID: uid_t) {
+    init(paths: KumoPaths, credentials: KumoServiceCredentials, authorizedUser: StateFileOwnership) {
         self.paths = paths
         self.credentials = credentials
-        self.authorizedUID = authorizedUID
+        self.authorizedUser = authorizedUser
     }
 
     func run() async throws {
@@ -232,8 +255,14 @@ private final class KumoServiceSocketServer: @unchecked Sendable {
         guard bindResult == 0 else {
             throw KumoError.serviceUnavailable("Unable to bind service socket at \(socketPath).")
         }
-        chmod(socketPath, S_IRUSR | S_IWUSR)
-        chown(socketPath, authorizedUID, getgid())
+        try checkPOSIX(
+            chmod(socketPath, S_IRUSR | S_IWUSR),
+            operation: "set service socket permissions"
+        )
+        try checkPOSIX(
+            chown(socketPath, authorizedUser.userID, authorizedUser.groupID),
+            operation: "set service socket owner"
+        )
 
         guard listen(descriptor, 16) == 0 else {
             throw KumoError.serviceUnavailable("Unable to listen on service socket.")
@@ -264,7 +293,11 @@ private final class KumoServiceSocketServer: @unchecked Sendable {
     }
 
     private func route(_ request: KumoServiceSignedRequest) async throws -> KumoServiceTransportResponse {
-        let controller = KumoController(paths: paths, useServiceBackend: false)
+        let controller = KumoController(
+            paths: paths,
+            useServiceBackend: false,
+            stateFileOwnership: authorizedUser
+        )
         switch (request.method, request.path) {
         case ("GET", "/service/status"):
             return try json(ServiceModeStatus(
@@ -340,4 +373,31 @@ private final class KumoServiceSocketServer: @unchecked Sendable {
             }
         }
     }
+}
+
+private func checkPOSIX(_ result: Int32, operation: String) throws {
+    guard result == 0 else {
+        throw posixError(operation: operation)
+    }
+}
+
+private func setDirectoryOwner(_ directory: URL, ownership: StateFileOwnership) throws {
+    let descriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else {
+        throw posixError(operation: "open application support directory")
+    }
+    defer { close(descriptor) }
+    try checkPOSIX(
+        fchown(descriptor, ownership.userID, ownership.groupID),
+        operation: "set application support owner"
+    )
+}
+
+private func posixError(operation: String) -> NSError {
+    let code = errno
+    return NSError(
+        domain: NSPOSIXErrorDomain,
+        code: Int(code),
+        userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(String(cString: strerror(code)))"]
+    )
 }

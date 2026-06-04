@@ -33,9 +33,9 @@ public struct CoreSupervisor: Sendable {
     private let paths: KumoPaths
     private let stateStore: CoreStateStore
 
-    public init(paths: KumoPaths = KumoPaths()) {
+    public init(paths: KumoPaths = KumoPaths(), stateFileOwnership: StateFileOwnership? = nil) {
         self.paths = paths
-        self.stateStore = CoreStateStore(paths: paths)
+        self.stateStore = CoreStateStore(paths: paths, ownership: stateFileOwnership)
     }
 
     @discardableResult

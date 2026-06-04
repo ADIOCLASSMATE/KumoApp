@@ -41,14 +41,19 @@ public struct KumoController: Sendable {
     public init(
         paths: KumoPaths = KumoPaths(),
         useServiceBackend: Bool = true,
-        systemProxyCommandRunner: SystemProxyCommandRunner = .live
+        systemProxyCommandRunner: SystemProxyCommandRunner = .live,
+        stateFileOwnership: StateFileOwnership? = nil
     ) {
         self.paths = paths
         self.profileRepository = ProfileRepository(paths: paths)
         self.overrideRepository = OverrideRepository(paths: paths)
-        self.supervisor = CoreSupervisor(paths: paths)
-        self.stateStore = CoreStateStore(paths: paths)
-        self.systemProxyController = SystemProxyController(paths: paths, commandRunner: systemProxyCommandRunner)
+        self.supervisor = CoreSupervisor(paths: paths, stateFileOwnership: stateFileOwnership)
+        self.stateStore = CoreStateStore(paths: paths, ownership: stateFileOwnership)
+        self.systemProxyController = SystemProxyController(
+            paths: paths,
+            commandRunner: systemProxyCommandRunner,
+            stateFileOwnership: stateFileOwnership
+        )
         self.coreInstaller = CoreInstaller(paths: paths)
         self.subStoreManager = SubStoreManager(paths: paths)
         self.backupManager = KumoBackupManager(paths: paths)

@@ -10,6 +10,9 @@ The first test suite covers:
 - Mihomo controller response mapping with mocked URL loading.
 - Backup export/import round trips.
 - Service request signing.
+- Privileged state writes preserve authorized-user ownership and permissions.
+- Privileged state writes reject symlinked state directories and invalid root
+  authorization identities.
 - CLI argument parsing, JSON envelope stability, color/log rendering rules, and
   npm-style help behavior.
 

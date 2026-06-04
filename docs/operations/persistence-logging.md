@@ -68,6 +68,9 @@ CoreKit import/export contract.
 This allows the CLI and GUI to share state without requiring a service in v1.
 Runtime setting models must decode missing fields with defaults so app updates
 can add new TUN controls without invalidating an existing `state.json`.
+When the privileged helper writes this file, it uses descriptor-based secure
+staging and atomic replacement, then preserves ownership for the authorized
+desktop user without following user-controlled temporary paths.
 
 ## User Preferences
 
