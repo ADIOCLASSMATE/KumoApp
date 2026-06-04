@@ -1,6 +1,110 @@
 import SwiftUI
 import KumoCoreKit
 
+// MARK: - Parser section
+
+struct SubStoreParserSection: View {
+    @Environment(SubStoreStore.self) private var subStore
+    @State private var mode: ParserMode = .proxies
+    @State private var platform = "JSON"
+    @State private var input = ""
+    @State private var result = ""
+    @State private var isParsing = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Picker(String(localized: "Parser type"), selection: $mode) {
+                    ForEach(ParserMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 220)
+
+                TextField("Target", text: $platform)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+
+                Spacer()
+
+                Button {
+                    Task { await parse() }
+                } label: {
+                    if isParsing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label(String(localized: "Parse"), systemImage: "arrow.right.doc.on.clipboard")
+                    }
+                }
+                .disabled(isParsing || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            HSplitView {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(String(localized: "Input"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $input)
+                        .font(.body.monospaced())
+                }
+                .padding(12)
+                .frame(minWidth: 320)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(String(localized: "Result"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(result)
+                            .font(.body.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(8)
+                    }
+                    .background(Color(nsColor: .textBackgroundColor))
+                }
+                .padding(12)
+                .frame(minWidth: 320)
+            }
+        }
+    }
+
+    private func parse() async {
+        isParsing = true
+        defer { isParsing = false }
+
+        let trimmedPlatform = platform.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = trimmedPlatform.isEmpty ? "JSON" : trimmedPlatform
+        let parsed: String?
+        switch mode {
+        case .proxies:
+            parsed = await subStore.parseProxies(data: input, platform: target)
+        case .rules:
+            parsed = await subStore.parseRules(data: input, platform: target)
+        }
+        result = parsed ?? ""
+    }
+}
+
+private enum ParserMode: String, CaseIterable, Identifiable {
+    case proxies
+    case rules
+
+    var id: String { rawValue }
+
+    var label: LocalizedStringResource {
+        switch self {
+        case .proxies: "Proxies"
+        case .rules: "Rules"
+        }
+    }
+}
+
 // MARK: - Settings section
 
 struct SubStoreSettingsSection: View {

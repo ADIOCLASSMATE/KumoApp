@@ -221,9 +221,11 @@ single thin toolbar with a `Subscriptions`/`Collections` segmented picker, an
 overflow `⋯` menu (advanced screens, restart, stop, open log), and a backend
 connection settings popover. The two primary sections each render their own
 list-detail layout. Power-user surfaces (Files, Modules, Artifacts, Archives,
-Share Tokens, Server Settings, Backend Logs) are presented on demand as sheets
-launched from the overflow menu rather than living in a permanent sidebar, so
-the default screen stays focused on subscriptions. Sub-Store data is cached in
+Share Tokens, Parser, Server Settings, Backend Logs) are presented on demand
+as sheets launched from the overflow menu rather than living in a permanent
+sidebar, so the default screen stays focused on subscriptions. The native
+Parser sheet accepts proxy or rule input, a target platform, and shows a
+selectable result. Sub-Store data is cached in
 a dedicated `@Observable` `SubStoreStore` so updates do not invalidate the rest
 of the app. There is no embedded web view: management lives entirely in
 SwiftUI, and the bundled Node sidecar continues to serve the JSON API. When the
