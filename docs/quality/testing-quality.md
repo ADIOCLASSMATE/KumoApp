@@ -83,6 +83,7 @@ Prioritize tests that do not mutate real system state:
 - Core runtime and System Proxy settings only commit after the user applies staged edits.
 - TUN helper uninstall asks for confirmation before removing the service.
 - Menu bar status item exposes start, stop, mode switching, refresh, profiles, proxy groups, and system proxy controls.
+- Proxy groups preserve the active runtime configuration's `proxy-groups:` sequence across Overview, Proxies, menu bar, and CLI surfaces.
 - App updates check the default GitHub Releases feed when no manifest override is set.
 - App update DMG downloads fail closed on SHA-256 mismatch and report a clear error when the current app location is not writable.
 - `kumo doctor --json` reports status, profile, and core candidate information.

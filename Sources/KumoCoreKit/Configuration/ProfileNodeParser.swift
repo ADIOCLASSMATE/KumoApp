@@ -69,10 +69,9 @@ public enum ProfileNodeParser {
     /// `selectedProxyName` are all `nil` because that information only
     /// becomes available once mihomo serves `/proxies`.
     ///
-    /// The result is sorted by `name.localizedCaseInsensitiveCompare` to
-    /// match the order `MihomoControllerClient.proxyGroups()` uses, so the
-    /// sidebar does not reshuffle when the core transitions from stopped to
-    /// running.
+    /// The result preserves the order of the YAML `proxy-groups:` sequence.
+    /// Live groups are reordered against this sequence by the shared
+    /// controller layer.
     ///
     /// - Returns: Empty array when YAML is empty, missing `proxy-groups:`,
     ///   or all entries fail validation. Throws only if YAML itself fails to
@@ -119,8 +118,30 @@ public enum ProfileNodeParser {
             ))
         }
 
-        return result.sorted { lhs, rhs in
-            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        return result
+    }
+
+    /// Returns every named entry in the YAML `proxy-groups:` sequence,
+    /// including groups that only reference providers through `use:`.
+    public static func parseProxyGroupNames(yaml: String) throws -> [String] {
+        let trimmed = yaml.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return []
+        }
+
+        let root = try Yams.load(yaml: yaml)
+        guard let dict = root as? [String: Any],
+              let groups = dict["proxy-groups"] as? [Any] else {
+            return []
+        }
+
+        return groups.compactMap { entry in
+            guard let group = entry as? [String: Any],
+                  let rawName = string(from: group["name"]) else {
+                return nil
+            }
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
         }
     }
 

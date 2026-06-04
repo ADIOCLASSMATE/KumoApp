@@ -107,7 +107,7 @@ final class ProfileNodeParserTests: XCTestCase {
 
         let groups = try ProfileNodeParser.parseProxyGroups(yaml: yaml)
 
-        XCTAssertEqual(groups.map(\.name), ["Auto", "Manual"]) // sorted
+        XCTAssertEqual(groups.map(\.name), ["Manual", "Auto"])
         XCTAssertEqual(groups.first(where: { $0.name == "Manual" })?.proxies.map(\.name), ["HK 01", "JP 02", "DIRECT"])
         XCTAssertEqual(groups.first(where: { $0.name == "Auto" })?.proxies.map(\.name), ["HK 01", "JP 02"])
 
@@ -152,5 +152,35 @@ final class ProfileNodeParserTests: XCTestCase {
     func testParseProxyGroupsReturnsEmptyForBlankInput() throws {
         XCTAssertEqual(try ProfileNodeParser.parseProxyGroups(yaml: ""), [])
         XCTAssertEqual(try ProfileNodeParser.parseProxyGroups(yaml: "\n\n"), [])
+    }
+
+    func testParsesProxyGroupNamesIncludingProviderOnlyGroups() throws {
+        let yaml = """
+        proxy-groups:
+          - name: First
+            type: select
+            use: [provider]
+          - name: Second
+            type: select
+            proxies: []
+        """
+
+        XCTAssertEqual(try ProfileNodeParser.parseProxyGroupNames(yaml: yaml), ["First", "Second"])
+    }
+
+    func testOrdersLiveGroupsAccordingToConfiguration() {
+        let liveGroups = [
+            ProxyGroup(name: "Runtime B"),
+            ProxyGroup(name: "Second"),
+            ProxyGroup(name: "First"),
+            ProxyGroup(name: "Runtime A")
+        ]
+
+        let ordered = ProxyGroupOrdering.matchingConfiguration(
+            liveGroups,
+            configuredGroupNames: ["First", "Second"]
+        )
+
+        XCTAssertEqual(ordered.map(\.name), ["First", "Second", "Runtime B", "Runtime A"])
     }
 }

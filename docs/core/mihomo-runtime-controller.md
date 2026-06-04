@@ -187,7 +187,11 @@ application pattern.
 - `GET /traffic` over WebSocket
 - `GET /memory` over WebSocket
 
-It maps proxy groups into `ProxyGroup`, proxy names into `ProxyNode`, rules into `RuleEntry`, and connections into `ConnectionEntry`.
+It maps proxy groups into `ProxyGroup`, proxy names into `ProxyNode`, rules into
+`RuleEntry`, and connections into `ConnectionEntry`. `KumoController` reorders
+the dictionary-shaped `/proxies` group response to match the active runtime
+configuration's `proxy-groups:` sequence, appending runtime-only groups after
+the configured groups.
 
 ## Sparkle-Parity Controller Surface
 

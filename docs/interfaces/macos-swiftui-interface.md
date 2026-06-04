@@ -124,9 +124,11 @@ to resolve from `ProxyCountry` plus any cached `detectedCountry` lookups.
 Selection state is intentionally not displayed in the preview because
 mihomo decides the actual selection at startup (saved selections,
 URLTest / Fallback group types) and showing the YAML default would be
-misleading. The moment the core transitions to `running`, the sidebar
-swaps in the live `proxyGroups` from `/proxies` without rearranging rows
-because both sources sort by `name.localizedCaseInsensitiveCompare`.
+misleading. The moment the core transitions to `running`, the sidebar swaps in
+the live `proxyGroups` from `/proxies` without rearranging rows. The shared
+controller reorders Mihomo's dictionary-shaped response to match the
+`proxy-groups:` sequence in the generated runtime configuration; runtime-only
+groups are appended in deterministic controller-client order.
 
 The stopped state is no longer surfaced as an in-pane banner — the toolbar
 Start / Stop button, menu bar status item, and the cards on the right pane

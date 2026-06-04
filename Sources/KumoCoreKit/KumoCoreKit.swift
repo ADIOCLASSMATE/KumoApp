@@ -237,12 +237,31 @@ public struct KumoController: Sendable {
 
     public func proxyGroups() async throws -> [ProxyGroup] {
         let status = try stateStore.load()
-        return try await MihomoControllerClient(endpoint: status.endpoint).proxyGroups()
+        let groups = try await MihomoControllerClient(endpoint: status.endpoint).proxyGroups()
+        guard let configuredGroupNames = configuredProxyGroupNamesForOrdering() else {
+            return groups
+        }
+        return ProxyGroupOrdering.matchingConfiguration(groups, configuredGroupNames: configuredGroupNames)
     }
 
     public func coreConfiguration() async throws -> CoreConfigurationSnapshot {
         let status = try stateStore.load()
         return try await MihomoControllerClient(endpoint: status.endpoint).configuration()
+    }
+
+    private func configuredProxyGroupNamesForOrdering() -> [String]? {
+        if let runtimeYAML = try? String(contentsOf: paths.runtimeConfigFile, encoding: .utf8),
+           let runtimeGroupNames = try? ProfileNodeParser.parseProxyGroupNames(yaml: runtimeYAML),
+           !runtimeGroupNames.isEmpty {
+            return runtimeGroupNames
+        }
+
+        guard let profile = try? profileRepository.loadDefaultProfile(),
+              let profileGroupNames = try? ProfileNodeParser.parseProxyGroupNames(yaml: profile.rawYAML),
+              !profileGroupNames.isEmpty else {
+            return nil
+        }
+        return profileGroupNames
     }
 
     public func waitForControllerReady(maxAttempts: Int = 30, intervalNanoseconds: UInt64 = 200_000_000) async throws {
