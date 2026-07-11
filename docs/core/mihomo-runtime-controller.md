@@ -43,6 +43,17 @@ PID are cleared together. Status checks also consult `work/core.pid`, so Kumo
 can recover a running state when the JSON state lost its PID but the managed
 core is still alive.
 
+Process probes treat `EPERM` from `kill(pid, 0)` as proof that the process
+exists. This is required when the unprivileged GUI checks a Mihomo process
+owned by the privileged Helper; permission denial must not be reported as a
+stopped core during profile switching or readiness checks.
+
+After `Process.run()` succeeds, startup is transactional: failures while
+writing the PID file, persisted state, or lifecycle event terminate the newly
+launched process and clear its PID file. Controller readiness also requires the
+recorded process to remain alive after the controller responds, preventing an
+older process on the same controller port from masking a failed new launch.
+
 This is still available as the local-process fallback. When Kumo Helper is
 installed and reachable, `KumoController` routes start, stop, restart, system
 proxy, and TUN operations through the signed Unix socket service backend so the

@@ -271,7 +271,14 @@ public struct KumoController: Sendable {
 
         for _ in 0..<maxAttempts {
             do {
+                guard try supervisor.isRecordedProcessRunning() else {
+                    throw KumoError.coreNotRunning
+                }
                 _ = try await client.version()
+                try await Task.sleep(nanoseconds: intervalNanoseconds)
+                guard try supervisor.isRecordedProcessRunning() else {
+                    throw KumoError.coreNotRunning
+                }
                 _ = try supervisor.updateReadiness(.controllerReady, message: "Mihomo controller is ready.")
                 return
             } catch {

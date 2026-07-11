@@ -4,6 +4,11 @@ import XCTest
 @testable import KumoCoreKit
 
 final class CoreSupervisorTests: XCTestCase {
+    func testProcessExistsWhenSignalProbeIsDenied() {
+        XCTAssertTrue(CoreSupervisor.processExists(killResult: -1, errorNumber: EPERM))
+        XCTAssertFalse(CoreSupervisor.processExists(killResult: -1, errorNumber: ESRCH))
+    }
+
     func testStartWritesPIDFileAndStopTerminatesProcess() throws {
         let paths = KumoPaths(applicationSupportDirectory: temporaryDirectory())
         let corePath = try makeLongRunningCore(in: paths.applicationSupportDirectory)
@@ -85,6 +90,21 @@ final class CoreSupervisorTests: XCTestCase {
         )
     }
 
+    func testRecordedProcessRunningBecomesFalseAfterChildExits() throws {
+        let paths = KumoPaths(applicationSupportDirectory: temporaryDirectory())
+        let corePath = try makeShortLivedCore(in: paths.applicationSupportDirectory)
+        let supervisor = CoreSupervisor(paths: paths)
+
+        _ = try supervisor.start(configuration: launchConfiguration(corePath: corePath))
+        XCTAssertTrue(try supervisor.isRecordedProcessRunning())
+
+        let deadline = Date().addingTimeInterval(2)
+        while try supervisor.isRecordedProcessRunning(), Date() < deadline {
+            usleep(50_000)
+        }
+        XCTAssertFalse(try supervisor.isRecordedProcessRunning())
+    }
+
     private func launchConfiguration(
         corePath: String,
         endpoint: ControllerEndpoint = ControllerEndpoint()
@@ -144,6 +164,14 @@ final class CoreSupervisorTests: XCTestCase {
 
         XCTFail("Timed out waiting for recorded core arguments")
         return []
+    }
+
+    private func makeShortLivedCore(in directory: URL) throws -> String {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("short-lived-mihomo")
+        try "#!/bin/sh\nsleep 0.1\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url.path
     }
 
     private func temporaryDirectory() -> URL {

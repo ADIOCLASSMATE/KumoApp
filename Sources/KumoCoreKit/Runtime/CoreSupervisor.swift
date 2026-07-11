@@ -76,26 +76,42 @@ public struct CoreSupervisor: Sendable {
         }
 
         let processID = Int32(process.processIdentifier)
-        try writeCorePID(processID)
-        let status = CoreStatus(
-            state: .running,
-            pid: processID,
-            corePath: corePath,
-            mode: configuration.mode,
-            endpoint: runtime.endpoint,
-            proxyPorts: runtime.proxyPorts,
-            systemProxyEnabled: currentStatus.systemProxyEnabled,
-            runtimeSettings: configuration.runtimeSettings,
-            systemProxySettings: currentStatus.systemProxySettings,
-            previousSystemProxySnapshot: currentStatus.previousSystemProxySnapshot,
-            serviceModeStatus: currentStatus.serviceModeStatus,
-            tunStatus: currentStatus.tunStatus,
-            readiness: .processLaunched,
-            message: "Mihomo core started."
-        )
-        try stateStore.save(status)
-        try appendRuntimeEvent(kind: "core.started", message: "Mihomo core started with pid \(processID).")
-        return status
+        do {
+            try writeCorePID(processID)
+            let status = CoreStatus(
+                state: .running,
+                pid: processID,
+                corePath: corePath,
+                mode: configuration.mode,
+                endpoint: runtime.endpoint,
+                proxyPorts: runtime.proxyPorts,
+                systemProxyEnabled: currentStatus.systemProxyEnabled,
+                runtimeSettings: configuration.runtimeSettings,
+                systemProxySettings: currentStatus.systemProxySettings,
+                previousSystemProxySnapshot: currentStatus.previousSystemProxySnapshot,
+                serviceModeStatus: currentStatus.serviceModeStatus,
+                tunStatus: currentStatus.tunStatus,
+                readiness: .processLaunched,
+                message: "Mihomo core started."
+            )
+            try stateStore.save(status)
+            try appendRuntimeEvent(kind: "core.started", message: "Mihomo core started with pid \(processID).")
+            return status
+        } catch {
+            _ = terminateProcess(processID)
+            try? removeCorePIDFile()
+            var failedStatus = currentStatus
+            failedStatus.state = .failed
+            failedStatus.pid = nil
+            failedStatus.readiness = nil
+            failedStatus.message = "Failed to record Mihomo process state: \(error.localizedDescription)"
+            try? stateStore.save(failedStatus)
+            try? appendRuntimeEvent(
+                kind: "core.failed",
+                message: failedStatus.message ?? "Failed to record Mihomo process state."
+            )
+            throw error
+        }
     }
 
     @discardableResult
@@ -167,6 +183,10 @@ public struct CoreSupervisor: Sendable {
         try stateStore.save(status)
         try appendRuntimeEvent(kind: "core.readiness", message: message ?? "Core readiness changed to \(readiness.rawValue).")
         return status
+    }
+
+    func isRecordedProcessRunning() throws -> Bool {
+        recordedPIDs(status: try stateStore.load()).contains { !hasProcessExited($0) }
     }
 
     public func recentRuntimeEvents(limit: Int = 200) throws -> [RuntimeEventEntry] {
@@ -253,7 +273,12 @@ public struct CoreSupervisor: Sendable {
     }
 
     private func isProcessAlive(_ pid: Int32) -> Bool {
-        Darwin.kill(pid, 0) == 0
+        let result = Darwin.kill(pid, 0)
+        return Self.processExists(killResult: result, errorNumber: errno)
+    }
+
+    static func processExists(killResult: Int32, errorNumber: Int32) -> Bool {
+        killResult == 0 || errorNumber == EPERM
     }
 
     private func terminateProcess(_ pid: Int32) -> Bool {
