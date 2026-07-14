@@ -2,6 +2,16 @@ import XCTest
 @testable import KumoCoreKit
 
 final class RuntimeConfigBuilderTests: XCTestCase {
+    func testBuildRejectsScalarProfileInsteadOfSilentlyBuildingEmptyRuntime() throws {
+        let profile = Profile(
+            name: "Encoded Subscription",
+            source: .inline,
+            rawYAML: Data("vless://example".utf8).base64EncodedString()
+        )
+
+        XCTAssertThrowsError(try RuntimeConfigBuilder().build(profile: profile))
+    }
+
     func testBuildAppendsControlledRuntimeSettings() throws {
         let profile = Profile(
             name: "Test",

@@ -105,6 +105,38 @@ final class CoreSupervisorTests: XCTestCase {
         XCTAssertFalse(try supervisor.isRecordedProcessRunning())
     }
 
+    func testStopTerminatesUntrackedKumoOwnedProcess() throws {
+        let paths = KumoPaths(applicationSupportDirectory: temporaryDirectory())
+        let corePath = try makeLongRunningCore(in: paths.applicationSupportDirectory)
+        try CoreStateStore(paths: paths).save(CoreStatus(corePath: corePath))
+        let process = try launchDetachedCore(
+            corePath: corePath,
+            workDirectory: paths.workDirectory.path,
+            endpoint: "127.0.0.1:9097"
+        )
+        defer { terminateForCleanup(process) }
+
+        _ = try CoreSupervisor(paths: paths).stop()
+
+        XCTAssertFalse(process.isRunning)
+    }
+
+    func testStopDoesNotTerminateSimilarProcessUsingDifferentWorkDirectory() throws {
+        let paths = KumoPaths(applicationSupportDirectory: temporaryDirectory())
+        let corePath = try makeLongRunningCore(in: paths.applicationSupportDirectory)
+        try CoreStateStore(paths: paths).save(CoreStatus(corePath: corePath))
+        let process = try launchDetachedCore(
+            corePath: corePath,
+            workDirectory: "/tmp/not-kumo-work",
+            endpoint: "127.0.0.1:9097"
+        )
+        defer { terminateForCleanup(process) }
+
+        _ = try CoreSupervisor(paths: paths).stop()
+
+        XCTAssertTrue(process.isRunning)
+    }
+
     private func launchConfiguration(
         corePath: String,
         endpoint: ControllerEndpoint = ControllerEndpoint()
@@ -149,6 +181,23 @@ final class CoreSupervisorTests: XCTestCase {
         try script.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url.path
+    }
+
+    private func launchDetachedCore(corePath: String, workDirectory: String, endpoint: String) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: corePath)
+        process.arguments = ["-d", workDirectory, "-ext-ctl", endpoint]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        usleep(100_000)
+        return process
+    }
+
+    private func terminateForCleanup(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        process.waitUntilExit()
     }
 
     private func recordedArguments(at url: URL) throws -> [String] {

@@ -40,6 +40,30 @@ final class ProfileRepositoryTests: XCTestCase {
         XCTAssertEqual(try repository.currentProfileSummary().id, "default")
     }
 
+    func testSaveRejectsInvalidScalarBeforeChangingCurrentProfile() throws {
+        let paths = KumoPaths(applicationSupportDirectory: temporaryDirectory())
+        let repository = ProfileRepository(paths: paths)
+        let valid = Profile(
+            name: "Valid",
+            source: .inline,
+            rawYAML: "proxies: []\nrules:\n  - MATCH,DIRECT\n"
+        )
+        _ = try repository.saveProfile(valid, preferredID: "valid")
+
+        XCTAssertThrowsError(
+            try repository.saveProfile(
+                Profile(name: "Invalid", source: .inline, rawYAML: "plain scalar"),
+                preferredID: "invalid"
+            )
+        )
+        XCTAssertEqual(try repository.currentProfileSummary().id, "valid")
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: paths.profilesDirectory.appendingPathComponent("invalid.yaml").path
+            )
+        )
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
