@@ -18,6 +18,11 @@ Kumo reads one manifest URL for the selected update channel:
 The selected channel is stored in `UserPreferences.updateChannel`. A blank
 custom URL means Kumo uses the default feed for that channel.
 
+Official feeds publish Apple Silicon arm64 builds only. There is no Intel or
+universal feed and the updater does not choose between architecture variants.
+A custom feed is therefore expected to preserve the same arm64 manifest
+contract.
+
 ## Manifest Contract
 
 `latest.yml` is uploaded as a release asset beside the DMG:
@@ -102,18 +107,43 @@ When the user installs an update:
 2. Kumo computes SHA-256 and deletes the file if it does not match the
    manifest.
 3. Kumo posts coarse download/install notification updates.
-4. If system proxy is enabled, Kumo disables it before replacement.
-5. If the core is running, Kumo stops it before replacement.
-6. Kumo launches the detached installer helper (`nohup` + background shell).
-7. Kumo quits immediately (`applicationShouldTerminate` returns
-   `.terminateNow` while `isInstallingUpdate` is set — no multi-second runtime
-   shutdown, because the helper is blocked on the current PID).
-8. The helper waits for the current app process to exit, mounts the DMG, copies
-   `Kumo.app` over the current app, detaches the DMG, and reopens Kumo.
+4. `KumoController.installAppUpdate(...)` enters the shared operation gate,
+   restores or safely disables System Proxy, stops the owning Mihomo runtime,
+   and then re-reads status. Installation is refused unless the runtime is
+   strictly stopped, System Proxy is off, and no restoration snapshot remains.
+   An installed but unreachable Helper therefore blocks the update instead of
+   permitting an unsafe local fallback.
+5. Kumo verifies DMG integrity, Developer ID signature, matching Kumo Team,
+   stapled notarization ticket, and Gatekeeper assessment. It mounts the DMG
+   read-only and copies `Kumo.app` to a unique staging path on the destination
+   volume.
+6. The staged app must have the expected bundle identifier and manifest
+   version. The App, embedded Helper, and CLI must be hardened-runtime
+   Developer ID code from the installed Kumo Team; those executables and the
+   bundled Node runtime must each contain exactly one arm64 slice. Node must
+   retain the expected Node.js Foundation signing Team. Any mismatch removes
+   the stage and aborts before replacement.
+7. Kumo launches the detached installer helper (`nohup` + background shell).
+8. Only after `installAppUpdate(...)` returns with the detached helper scheduled
+   does Kumo set `isUpdateInstallerReadyForTermination`. At that point
+   `applicationShouldTerminate` returns `.terminateNow`—step 4 has already
+   proved cleanup and the helper is blocked on the current PID. The earlier UI
+   progress flag alone cannot bypass normal termination cleanup.
+9. After the current process exits, the helper revalidates the installed and
+   staged app identities, moves the old app to a same-volume backup, atomically
+   moves the staged app into place, and reopens Kumo. A failure after backup
+   restores and reopens the previous app; if automatic rollback itself fails,
+   recovery artifacts are preserved instead of being deleted.
 
 The helper is external because an app cannot safely overwrite its own bundle
 while it is running. Do not call `Process.run()` on the installer script
 directly: it waits for the script to finish, which deadlocks against step 7.
+
+Replacing `Kumo.app` does not replace an already installed LaunchDaemon copy of
+Kumo Helper. If an update changes Helper protocols, endpoints, or trust rules,
+repair or reinstall Kumo Helper before the next runtime start. The fail-closed
+backend rule prevents the new App from silently launching a local core beside
+an incompatible or unreachable old daemon.
 
 ## Logs and Cache
 

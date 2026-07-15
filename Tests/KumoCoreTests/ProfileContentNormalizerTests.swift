@@ -86,6 +86,33 @@ final class ProfileContentNormalizerTests: XCTestCase {
         }
     }
 
+    func testBundledSubStoreConvertsBase64VLESSSubscription() async throws {
+        let normalizer = ProfileContentNormalizer(
+            converter: IsolatedSubStoreSubscriptionConverter()
+        )
+        let uri = "vless://00000000-0000-4000-8000-000000000000@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#Alpha"
+        let encoded = Data(uri.utf8).base64EncodedString()
+
+        let output = try await normalizeWithBundledRuntime(normalizer, content: encoded)
+
+        XCTAssertEqual(try ProfileNodeParser.parseNodes(yaml: output).keys.sorted(), ["Alpha"])
+        XCTAssertFalse(try ProfileNodeParser.parseProxyGroupNames(yaml: output).isEmpty)
+        XCTAssertTrue(output.contains("MATCH,"))
+    }
+
+    func testBundledSubStoreConvertsBase64Hysteria2Subscription() async throws {
+        let normalizer = ProfileContentNormalizer(
+            converter: IsolatedSubStoreSubscriptionConverter()
+        )
+        let uri = "hysteria2://password@example.net:8443?sni=example.net#Beta"
+        let encoded = Data(uri.utf8).base64EncodedString()
+
+        let output = try await normalizeWithBundledRuntime(normalizer, content: encoded)
+
+        XCTAssertEqual(try ProfileNodeParser.parseNodes(yaml: output).keys.sorted(), ["Beta"])
+        XCTAssertFalse(try ProfileNodeParser.parseProxyGroupNames(yaml: output).isEmpty)
+    }
+
     private var convertedProxyYAML: String {
         """
         proxies:
@@ -96,6 +123,20 @@ final class ProfileContentNormalizerTests: XCTestCase {
             cipher: aes-128-gcm
             password: test
         """
+    }
+
+    private func normalizeWithBundledRuntime(
+        _ normalizer: ProfileContentNormalizer,
+        content: String
+    ) async throws -> String {
+        do {
+            return try await normalizer.normalize(content)
+        } catch KumoError.commandFailed(let message)
+            where message == "Bundled subscription parser resources are incomplete." {
+            throw XCTSkip(
+                "Run `make prepare-substore-runtime` to enable bundled Sub-Store integration tests."
+            )
+        }
     }
 }
 

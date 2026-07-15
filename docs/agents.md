@@ -10,33 +10,32 @@ task category to the canonical document or command that owns it.
 Key commands:
 
 ```bash
-# Full workflow: pull → build arm64 → build amd64 → tag → release → upload manifests
+# Kumo releases are Apple Silicon arm64 only.
 make clean
-make release-dmg VERSION=0.0.10       # arm64
-rm -rf build/Build/Products/Release build/release/latest.yml
-make release-dmg-amd64 VERSION=0.0.10  # amd64
+make release-dmg VERSION=0.0.10 \
+  DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM" \
+  CODE_SIGN_IDENTITY="$APPLE_CODE_SIGN_IDENTITY" \
+  NOTARY_KEY_PATH="$APPLE_NOTARY_KEY_PATH" \
+  NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
+  NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID"
 
 git tag -a "0.0.10" -m "Kumo 0.0.10"
 git push origin "0.0.10"
-
-gh release create "0.0.10" --title "Kumo 0.0.10" --notes "..." \
-  build/release/Kumo-macos-0.0.10-arm64.dmg \
-  build/release/Kumo-macos-0.0.10-amd64.dmg
-
-gh release upload "0.0.10" \
-  build/release/latest.yml \
-  build/release/latest-amd64.yml \
-  --clobber
+gh run list --workflow build-release.yml --limit 1
 ```
 
-**Never forget:** upload `latest.yml` + `latest-amd64.yml` after creating the
-release. The in-app update checker will 404 without them.
+The release command fails unless the App, Helper, CLI, and bundled Node are
+exactly arm64; Kumo-owned binaries must use hardened-runtime Developer ID
+Application signing from one Team. The DMG is signed, notarized, stapled, and
+only then hashed into `latest.yml`.
+
+**Never forget:** verify the workflow uploaded `latest.yml`. The in-app update
+checker will 404 without it.
 
 **Verify URLs:**
 
 ```bash
 curl -sI "https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest.yml"
-curl -sI "https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest-amd64.yml"
 ```
 
 ## Update Runtime Behavior
@@ -45,7 +44,8 @@ curl -sI "https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest
 
 - Feed URLs, manifest contract, polling logic, notifications, installer helper.
 - `AppUpdateManager` in `Sources/KumoCoreKit/Support/AppUpdateManager.swift`.
-- Architecture-aware feed suffix: arm64 → `latest.yml`, x86_64 → `latest-amd64.yml`.
+- Apple Silicon uses the single `latest.yml` feed. Intel builds and feeds are
+  intentionally unsupported.
 
 ## Domain Reference
 
@@ -77,8 +77,7 @@ make app              # Debug build
 make dev              # Quit, clean debug, build, and open
 make test             # Run unit tests
 make clean            # Remove all build artifacts
-make release-dmg VERSION=x.y.z          # arm64 release
-make release-dmg-amd64 VERSION=x.y.z    # amd64 release
+make release-dmg VERSION=x.y.z  # signed, notarized arm64 release
 ```
 
 ## Decision Records

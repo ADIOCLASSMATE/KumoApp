@@ -37,6 +37,7 @@ final class KumoAppDelegate: NSObject, NSApplicationDelegate, UNUserNotification
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !KumoAppLaunchMode.isIsolatedSmokeTest else { return }
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.delegate = self
         AppNotificationCoordinator.shared.registerCategories()
@@ -61,9 +62,12 @@ final class KumoAppDelegate: NSObject, NSApplicationDelegate, UNUserNotification
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if KumoAppLaunchMode.isIsolatedSmokeTest {
+            return .terminateNow
+        }
         // The detached update helper blocks until this process exits. Skip the
         // normal shutdown path (already stopped core/proxy before install).
-        if KumoAppContext.shared.store?.isInstallingUpdate == true {
+        if KumoAppContext.shared.store?.isUpdateInstallerReadyForTermination == true {
             return .terminateNow
         }
 

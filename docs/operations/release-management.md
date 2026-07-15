@@ -1,271 +1,204 @@
 # Release Management
 
-Kumo publishes macOS app updates through GitHub Releases. Release artifacts
-include a signed app DMG and a small manifest consumed by the runtime update
-system.
+Kumo publishes one macOS build: Apple Silicon arm64. Intel and universal
+binaries are intentionally unsupported. Every public release contains a signed,
+notarized DMG and the `latest.yml` manifest consumed by the in-app updater.
 
-Runtime discovery, five-minute asynchronous polling, local update
-notifications, checksum verification, and installer-helper behavior are
-documented in [App Updates](app-updates/README.md).
+Runtime discovery, checksum verification, and installer behavior are documented
+in [App Updates](app-updates/README.md).
 
-## Release SOP
+## Release Trust Requirements
 
-The canonical release workflow for a new version (e.g. `0.0.10`). Follow these
-steps in order. Do not skip the verification steps.
+A release must satisfy all of these conditions before a final-named artifact or
+manifest is published:
 
-### 1. Pre-flight Checks
+- `Kumo`, `KumoService`, the bundled `kumo` CLI, and the Sub-Store Node runtime
+  are executable arm64 Mach-O files with no additional architecture slices.
+- `Kumo.app`, `KumoService`, and `kumo` use hardened-runtime Developer ID
+  Application signatures from the configured Kumo Team.
+- The DMG is signed with the same Developer ID Application identity.
+- Apple notarization returns `Accepted`; the ticket is stapled and validated.
+- The SHA-256 in `latest.yml` is calculated after signing and stapling.
+
+The build fails closed when an architecture, signing identity, Team ID,
+notarization credential, notarization result, or bundled executable is invalid.
+Passing `ARCH=amd64`, `ARCH=x86_64`, or an unknown architecture is an error.
+DMG creation, notarization, stapling, and validation happen in a temporary
+release stage; only the verified DMG is moved into `build/release/`, and
+`latest.yml` is generated afterward. A validation failure cleans the temporary
+stage without replacing the final names; previously verified outputs, if any,
+remain unchanged.
+
+## Required Credentials
+
+Local releases require:
+
+- `DEVELOPMENT_TEAM` — the ten-character Apple Team ID;
+- `CODE_SIGN_IDENTITY` — an installed Developer ID Application identity;
+- `NOTARY_KEY_PATH` — an App Store Connect API `.p8` private key;
+- `NOTARY_KEY_ID` — the API key ID;
+- `NOTARY_ISSUER_ID` — the API issuer UUID.
+
+GitHub Actions uses the corresponding secrets:
+
+- `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`
+- `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`
+- `APPLE_CODE_SIGN_IDENTITY`
+- `APPLE_DEVELOPMENT_TEAM`
+- `APPLE_NOTARY_KEY_P8_BASE64`
+- `APPLE_NOTARY_KEY_ID`
+- `APPLE_NOTARY_ISSUER_ID`
+
+The workflow imports the certificate into an ephemeral keychain and rejects an
+identity that is not `Developer ID Application` for the configured Team.
+
+## Local Release SOP
+
+The example below releases `0.0.10`. Release versions must use numeric `x.y.z`
+format.
+
+### 1. Pre-flight
 
 ```bash
-# Ensure working tree is clean and you are on main
 git status
-git branch
-
-# Pull latest remote changes
+git branch --show-current
 git fetch origin
 git pull origin main
-
-# Verify the version you are about to release does not already exist
-git tag -l | grep "^0\.0\.10$"
-# Should print nothing. If it prints the tag, abort.
+git tag -l | grep '^0\.0\.10$'
+# The final command must print nothing. Abort if the tag already exists.
 ```
 
-### 2. Build arm64 (Apple Silicon) DMG
+Run the normal verification suite before signing:
 
 ```bash
-# Clean previous build artifacts to avoid architecture contamination
-make clean
+make swift-test
+make app
+```
 
-# Build release DMG for arm64
-make release-dmg VERSION=0.0.10
+### 2. Build, sign, and notarize
+
+```bash
+make clean
+make release-dmg VERSION=0.0.10 ARCH=arm64 \
+  DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM" \
+  CODE_SIGN_IDENTITY="$APPLE_CODE_SIGN_IDENTITY" \
+  NOTARY_KEY_PATH="$APPLE_NOTARY_KEY_PATH" \
+  NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
+  NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID"
 ```
 
 Outputs in `build/release/`:
 
 - `Kumo-macos-0.0.10-arm64.dmg`
-- `latest-arm64.yml`
-- `latest.yml` (backward-compatible alias for arm64)
+- `latest.yml`
 
-**Verify:**
+`make app-release` refreshes the official arm64 Node runtime from a
+checksum-verified Node archive. It verifies the Node version, exact Mach-O
+architecture, and Node.js Foundation signature before bundling it.
 
-```bash
-ls -la build/release/
-# Expect three files; note the arm64 DMG size and SHA-256 for later
-```
-
-### 3. Build amd64 (Intel) DMG
-
-The amd64 build must not reuse the Release products directory from the arm64
-build, otherwise Xcode may produce a mixed-architecture bundle.
+### 3. Verify the finished artifacts
 
 ```bash
-# Remove only the Release products, keeping the arm64 DMG
-rm -rf build/Build/Products/Release build/release/latest.yml
+APP=build/Build/Products/Release/Kumo.app
 
-# Build release DMG for Intel
-make release-dmg-amd64 VERSION=0.0.10
+test "$(lipo -archs "$APP/Contents/MacOS/Kumo")" = arm64
+test "$(lipo -archs "$APP/Contents/MacOS/KumoService")" = arm64
+test "$(lipo -archs "$APP/Contents/Helpers/kumo")" = arm64
+test "$(lipo -archs "$APP/Contents/Resources/Kumo_KumoCoreKit.bundle/Contents/Resources/SubStore/node/bin/node")" = arm64
+
+codesign --verify --strict --deep --all-architectures "$APP"
+codesign -dv --verbose=4 "$APP"
+codesign -dv --verbose=4 "$APP/Contents/MacOS/KumoService"
+codesign -dv --verbose=4 "$APP/Contents/Helpers/kumo"
+
+DMG=build/release/Kumo-macos-0.0.10-arm64.dmg
+codesign --verify --strict "$DMG"
+xcrun stapler validate "$DMG"
+hdiutil verify "$DMG"
+shasum -a 256 "$DMG"
+grep '^sha256:' build/release/latest.yml
 ```
 
-Outputs in `build/release/`:
+The three Kumo signing reports must show the configured Team ID, a Developer ID
+Application authority, and the `runtime` code-signing flag. The checksum must
+match `latest.yml`.
 
-- `Kumo-macos-0.0.10-amd64.dmg`
-- `latest-amd64.yml`
+### 4. Tag and publish through GitHub Actions
 
-The `latest.yml` alias is intentionally omitted here; it was already produced
-by the arm64 build and must not be overwritten with amd64 URLs.
-
-**Verify:**
+Release notes must be in English and should be passed with `--notes-file` to
+avoid shell-escaping damage when a release is edited manually.
 
 ```bash
-ls -la build/release/
-# Expect four files total (two DMGs + latest-arm64.yml + latest-amd64.yml)
+git tag -a '0.0.10' -m 'Kumo 0.0.10'
+git push origin '0.0.10'
+gh run list --workflow build-release.yml --limit 1
 ```
 
-### 4. Verify Architecture Isolation
+The tag push starts `.github/workflows/build-release.yml`, which repeats the
+arm64-only signed/notarized build and publishes the DMG and manifest. Do not run
+`gh release create` in parallel with that job. `workflow_dispatch` uses its
+required `version` input instead of the selected branch name; beta dispatches
+update the rolling `pre-release` tag used by the beta feed. Updating an existing
+release first moves it back to draft and verifies that hidden state. New and
+existing releases replace the arm64 DMG and `latest.yml`, remove every other
+attachment, and verify those are the only two asset names while still draft.
+Publishing is the final mutation; a failed upload, cleanup, or verification
+leaves the release draft so incomplete assets are not visible to update feeds.
 
-Confirm each DMG contains a binary for exactly one architecture:
-
-```bash
-# Mount DMGs and inspect the binary (or use lipo on the extracted app)
-# The arm64 DMG app should report: arm64
-# The amd64 DMG app should report: x86_64
-```
-
-If either app reports both architectures, the build was contaminated. Start
-over from `make clean`.
-
-### 5. Create and Push Git Tag
-
-```bash
-git tag -a "0.0.10" -m "Kumo 0.0.10"
-git push origin "0.0.10"
-```
-
-### 6. Create GitHub Release
-
-Use `gh release create` with both DMGs. Write release notes covering all
-commits since the previous tag.
-
-**Requirements:**
-- Release notes **must be written in English**.
-- Release notes **must not contain garbled characters or escaped newlines** (`\n` appearing as literals). Use `--notes-file` instead of `--notes` to avoid shell escaping issues.
-
-```bash
-# Write release notes to a file first
-cat > /tmp/release-notes.md <<'EOF'
-## What's Changed
-
-### Features
-- Summarize each user-facing change.
-
-### Bug Fixes
-- Mention any bug fixes, especially user-reported issues.
-
-### Infrastructure
-- Internal refactors, dependency bumps, etc.
-EOF
-
-gh release create "0.0.10" \
-  --title "Kumo 0.0.10" \
-  --notes-file /tmp/release-notes.md \
-  --verify-tag \
-  build/release/Kumo-macos-0.0.10-arm64.dmg \
-  build/release/Kumo-macos-0.0.10-amd64.dmg
-```
-
-### 7. Upload Manifest Files
-
-The DMG upload in step 6 does not include the manifest files. Upload them
-separately. These are consumed by the in-app update checker.
-
-```bash
-gh release upload "0.0.10" \
-  build/release/latest.yml \
-  build/release/latest-amd64.yml \
-  --clobber
-```
-
-**Verify:**
+### 5. Verify update discovery
 
 ```bash
 gh release view 0.0.10 --json assets
-# Expect four assets: two DMGs + latest.yml + latest-amd64.yml
+curl -sI 'https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest.yml'
 ```
 
-### 8. Verify Update URLs
-
-```bash
-# These must return 302 (redirect to the actual asset), not 404
-curl -sI "https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest.yml"
-curl -sI "https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest-amd64.yml"
-```
-
-### 9. Smoke Test In-App Update Check
-
-Install the new DMG on a test machine (or the build machine), open the app,
-navigate to **About Kumo** and click **Check for Updates**.
-
-- Expected: "Kumo is up to date." (no error, no 404).
-- If it returns HTTP 404, the manifest files were not uploaded correctly.
-
-### 10. Update Release Notes (Optional)
-
-If the initial release notes were minimal, edit them on the GitHub release page
-with a fuller summary. The release notes are what users read; the manifest
-`releaseNotes` field only needs to point back to the release page.
-
-**Remember:** Release notes must always be in English and properly formatted
-(no literal `\n` or garbled text).
-
----
+The release must contain exactly the arm64 DMG and `latest.yml`. Open the DMG on
+an Apple Silicon test Mac, install Kumo, and use **About Kumo → Check for
+Updates**. A missing manifest produces HTTP 404 and must be corrected before the
+release is announced.
 
 ## Release Channels
 
-- Stable updates read `https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest.yml` (arm64) or `latest-amd64.yml` (Intel).
-- Beta updates read `https://github.com/ProjectKumo/KumoApp/releases/download/pre-release/latest.yml` (arm64) or `latest-amd64.yml` (Intel).
-- Settings may override the manifest URL for development or private feeds. Leave it blank for the default GitHub Releases feed.
+- Stable reads
+  `https://github.com/ProjectKumo/KumoApp/releases/latest/download/latest.yml`.
+- Beta reads
+  `https://github.com/ProjectKumo/KumoApp/releases/download/pre-release/latest.yml`.
+- Settings may override the manifest URL for development or private feeds.
 
-## Manifest Format
+There is no architecture-specific Intel feed. `AppUpdateManager` always uses
+the Apple Silicon `latest.yml` contract.
 
-Kumo's updater consumes one manifest per architecture. The default stable feed
-uses the Apple Silicon manifest:
-
-- `latest.yml` — arm64 / Apple Silicon
-- `latest-amd64.yml` — amd64 / Intel x86_64
-
-Each manifest keeps the single-asset shape expected by
-`AppUpdateManager`: `downloadURL`, `assetName`, and `sha256`. Do not replace
-these files with a combined `assets:` list unless the app-side parser is
-changed in the same release.
+## Manifest Contract
 
 ```yaml
-version: 0.0.1
+version: 0.0.10
 channel: stable
-downloadURL: https://github.com/ProjectKumo/KumoApp/releases/download/0.0.1/Kumo-macos-0.0.1-arm64.dmg
-assetName: Kumo-macos-0.0.1-arm64.dmg
-sha256: <64-character-sha256>
+downloadURL: https://github.com/ProjectKumo/KumoApp/releases/download/0.0.10/Kumo-macos-0.0.10-arm64.dmg
+assetName: Kumo-macos-0.0.10-arm64.dmg
+sha256: <64-character-sha256-of-the-stapled-dmg>
 releaseNotes: |
-  See https://github.com/ProjectKumo/KumoApp/releases/tag/0.0.1
+  See https://github.com/ProjectKumo/KumoApp/releases/tag/0.0.10
 ```
 
-The app also accepts the same fields as JSON for local testing and backwards
-compatibility. See [App Updates](app-updates/README.md) for the runtime
-manifest contract and automatic-install requirements.
+The updater also accepts these fields as JSON for local testing. Keep the
+single-asset shape unless the app-side parser changes in the same release.
 
-## Building Artifacts
+## Bundled Runtime and Helper Checks
 
-Use the release helper to build the Release `.app`, create the DMG, and emit
-the architecture-specific manifest:
+Release builds include the Sub-Store backend, manifest, and arm64 Node sidecar
+inside `KumoCoreKit` resources. Node is generated during the build and is not
+tracked in Git. Base64 and URI subscription conversion happens in the App or
+CLI before a signed Helper request, so the standalone Helper does not need the
+Sub-Store resource bundle.
 
-```bash
-make release-dmg VERSION=0.0.1 CHANNEL=stable ARCH=arm64
-make release-dmg VERSION=0.0.1 CHANNEL=stable ARCH=amd64
-# shorthand for Intel: make release-dmg-amd64 VERSION=0.0.1 CHANNEL=stable
-```
+Releases that change Helper endpoints or runtime trust rules must repair or
+reinstall Kumo Helper during smoke testing. Verify that the release-signed
+Helper passes the same-Team check, installs through the digest-pinned root
+stage, and atomically replaces an existing Helper. Copying a new `Kumo.app`
+does not itself replace an already installed LaunchDaemon executable, so update
+QA must complete this repair before starting the new runtime when compatibility
+changed.
 
-`VERSION` is passed through to Xcode as `MARKETING_VERSION`, so the built
-`Kumo.app/Contents/Info.plist` and manifests use the same app version.
-Override `BUILD_NUMBER` to set `CFBundleVersion`; it defaults to `1`.
-The artifact script validates the built app version before creating the DMG.
-
-Release builds must also include the bundled Sub-Store payload in
-`KumoCoreKit` resources: Node sidecar, `sub-store.bundle.js`, and
-`manifest.json`. The Sub-Store frontend is no longer bundled; Kumo's SwiftUI
-UI talks to the backend directly. Kumo does not download Sub-Store at
-runtime; app updates are the update channel for the bundled Sub-Store
-resources. The Node sidecar is not tracked in Git; `make app-release` runs
-`Scripts/prepare_substore_runtime.sh` before invoking Xcode so the generated
-runtime is present in the resource bundle without committing the large binary.
-
-The DMG is laid out as a Finder install window. `Assets/dmg-background.png`
-provides the 660×420 paper background with handwritten labels and a
-pencil-drawn small-loop arrow from `Kumo.app` toward the `/Applications` alias.
-If Finder automation cannot address the mounted volume, the script logs a
-warning and still emits a usable DMG with the default Finder layout.
-
-Outputs are written to `build/release/` for the selected architecture:
-
-- `Kumo-macos-0.0.1-arm64.dmg` or `Kumo-macos-0.0.1-amd64.dmg`
-- `latest.yml` for that architecture
-
-For a dual-architecture GitHub release, collect and upload these four assets:
-
-- `Kumo-macos-0.0.1-arm64.dmg`
-- `Kumo-macos-0.0.1-amd64.dmg`
-- `latest-arm64.yml` and `latest-amd64.yml` (per-architecture manifests)
-- `latest.yml` (backward-compatible arm64 alias)
-
-Upload both DMGs, `latest.yml`, and `latest-amd64.yml` to the GitHub Release.
-The `.github/workflows/build-release.yml` workflow automates this collection,
-validates that each manifest points at the matching architecture and tag, and
-uploads all four assets. For beta, set `CHANNEL=beta`; the manifest points at
-the `pre-release` tag unless `RELEASE_TAG` is explicitly provided.
-
-## Runtime Update Flow
-
-For runtime behavior, see [App Updates](app-updates/README.md). That document
-owns the app-side polling, notification throttling, download cache, and
-installer-helper details.
-
-Automatic replacement requires the current app's parent directory to be
-writable. If Kumo is in a protected location, the update flow reports a clear
-error and the user can install manually from the download page.
+The DMG uses `Assets/dmg-background.png` for its Finder layout. Finder layout
+automation may fall back to a default window, but signing, notarization,
+stapling, architecture validation, and manifest generation never fall back.

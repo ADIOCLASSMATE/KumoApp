@@ -67,7 +67,7 @@ struct StopKumoIntent: AppIntent {
 
     func perform() async throws -> some IntentResult {
         let store = try await MainActor.run { try IntentResolver.store() }
-        await MainActor.run { store.stopCore() }
+        await store.stopCore()
         return .result()
     }
 }

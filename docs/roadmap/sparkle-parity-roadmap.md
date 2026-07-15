@@ -26,46 +26,47 @@ updates, and backup workflows.
 | Profiles | Local profile import and edit | implemented | `ProfileRepository` | Local YAML can be imported, edited, selected, and deleted safely. |
 | Profiles | Remote profile refresh | implemented | `ProfileRepository` | Remote subscriptions refresh manually and on due intervals. |
 | Profiles | Subscription metadata retention | partial | `ProfileRepository` | Headers persist name, home URL, update interval, user info, UA, and fingerprint. |
-| Overrides | Ordered YAML overrides | partial | `OverrideRepository` | Global and profile-scoped YAML overrides apply in documented order. |
+| Overrides | Ordered YAML overrides | implemented | `OverrideRepository` | Profile-scoped and global YAML apply in documented order, mutations preflight affected profiles, and failed live activation restores both files and runtime. |
 | Overrides | JavaScript transforms | deferred | `OverrideRepository` | Requires a reviewed sandbox strategy before enablement. |
 | Controller | Proxy groups and selection | implemented | `MihomoControllerClient` | Groups load, filter hidden entries, and allow node selection. |
 | Controller | Outbound mode switching | implemented | `KumoAppStore` / `MihomoControllerClient` | Rule / Global / Direct changes persist locally, PATCH Mihomo `/configs`, close existing connections, and refresh proxy groups without blocking the Start / Stop toolbar action. |
 | Controller | Rules, connections, providers, geo updates | partial | `MihomoControllerClient` | Inspect and Configure pages expose controller actions without direct UI clients. |
-| Controller | Traffic, memory, logs, and lifecycle events | partial | `MihomoControllerClient` | Event streams use bounded caches and survive transient disconnects. |
+| Controller | Traffic, memory, logs, and lifecycle events | partial | `MihomoControllerClient` | Event streams use bounded caches and generation guards; resilient reconnect remains incomplete. |
 | CLI | Stable agent-friendly JSON commands | partial | `KumoCLI` | Every command has `--json`, stable envelopes, and deterministic exit codes. |
 | System Proxy | Manual macOS system proxy | implemented | `SystemProxyController` | Dry-run and real commands configure web, secure web, and SOCKS proxy. |
-| System Proxy | Active service detection and restore | planned | `SystemProxyController` | Kumo detects network services and restores previous proxy settings on disable. |
-| System Proxy | PAC hosting and guard | planned | `SystemProxyController` / `KumoService` | PAC and auto-restore run only after service-mode support exists. |
-| Service | Privileged service backend | planned | `KumoService` | GUI and CLI can switch backend without public command changes. |
-| Service | Signed local service requests | planned | `KumoService` | Requests use key material, timestamps, nonces, and body hashing. |
+| System Proxy | Active service detection and exact restore | implemented | `SystemProxyController` | Kumo resolves the active service, restores the captured manual/PAC snapshot, and rolls partial command failures back. |
+| System Proxy | PAC hosting and restart reconciliation | implemented | `SystemProxyController` / `KumoService` | Local and Helper ownership keep PAC listeners alive; Helper restart reconciliation re-applies verified state or disables safely. |
+| Service | Privileged service backend | implemented | `KumoService` | GUI and CLI require compatible Helper ownership for production runtime mutations and never fall back to a local supervisor. |
+| Service | Signed local service requests | implemented | `KumoService` | Requests use key material, timestamps, nonces, body hashing, replay protection, and a protected Unix socket. |
 | Sub-Store | Persisted configuration | implemented | `SubStoreManager` | Status, local resource version, backend port, cron settings, proxy mode, LAN mode, and custom backend settings persist. |
 | Sub-Store | Local lifecycle management | implemented | `SubStoreManager` / `SubStoreSupervisor` | Bundled Node sidecar + `sub-store.bundle.js` are prepared on demand; Kumo starts, stops, and restarts the backend. |
 | Sub-Store | Native management UI | implemented | `KumoApp.SubStoreView` / `SubStoreClient` | SwiftUI surfaces subscriptions, collections, files, modules, artifacts, archives, tokens, settings, and logs by talking to the backend over HTTP. |
 | Resources | Proxy/rule provider management | partial | `MihomoControllerClient` | Providers list, update, and show useful metadata in Configure. |
 | Diagnostics | Connections and logs inspection | partial | `MihomoControllerClient` / `KumoAppStore` | Active/closed connections, close actions, filtering, and live logs are available. |
-| Backup | Export/import local state | planned | `KumoCoreKit` | Profiles, overrides, settings, Sub-Store status, and service settings round-trip. |
-| Updates | App update channel and installer | planned | Distribution layer | Stable/beta app updates verify signatures and coordinate core/proxy state. |
+| Backup | Export/import local state | implemented | `KumoCoreKit` | Profiles, overrides, settings, Sub-Store status, and state round-trip through a manifest-backed directory. |
+| Updates | App update channel and installer | implemented | Distribution layer | Stable/beta manifests, checksum verification, hard runtime/proxy cleanup gating, strict signed arm64 candidate validation, and rollback-capable detached replacement are implemented. |
 | UI | Native Daily / Inspect / Configure IA | implemented | `KumoApp` | Advanced features remain secondary to the daily connection workflow. |
 | UI | Sparkle-level advanced controls | partial | `KumoAppStore` / Views | Proxies, connections, rules, logs, profiles, and settings reach feature parity. |
 | Quality | CoreKit unit tests | partial | `KumoCoreTests` | Runtime, profile, override, state, proxy, and controller mapping tests pass. |
-| Quality | CLI, service, and UI store tests | planned | Tests | JSON snapshots, service auth/fallback, and store state transitions are covered. |
+| Quality | CLI, service, and UI store tests | partial | Tests | CLI envelopes, service authentication/fail-closed ownership, and critical store-generation transitions have coverage; broader UI/update integration remains. |
 
-## Implementation Order
+## Next Priorities
 
-1. Stabilize the structured configuration pipeline and controller contract tests.
-2. Expand runtime supervision and event streams while keeping local process mode
-   as the default.
-3. Add system proxy restore and service-ready abstractions before privileged
-   service installation.
-4. Build Sub-Store, backup, update, and advanced UI features on the stabilized
-   control layer.
-5. Raise release quality with CLI snapshots, service tests, migration tests,
-   and manual QA checklists.
+1. Improve automatic Helper repair, installed-but-unreachable diagnostics, and
+   update-time protocol/trust migration.
+2. Migrate the contained root-stage installer to `SMAppService.daemon` without
+   weakening fail-closed ownership.
+3. Expose clearer update recovery and Helper-compatibility diagnostics.
+4. Expand signed-DMG integration, Helper restart, proxy restoration, and
+   SwiftUI store tests.
+5. Continue provider/event-stream parity and reviewed diagnostics UX.
 
 ## Non-Goals
 
 - Do not port Sparkle's Electron renderer or giant IPC surface.
 - Do not add JavaScript overrides until sandboxing and audit behavior are
   explicitly designed.
-- Do not make TUN, PAC guard, or privileged networking part of the primary
-  daily workflow before service mode is ready.
+- Do not silently fall back to a local core when an installed Helper is
+  unreachable.
+- Do not add Intel or universal release variants; Kumo's supported release
+  architecture is Apple Silicon arm64 only.

@@ -22,7 +22,7 @@ on:
 
 jobs:
   build-macos:
-    name: Build macOS DMGs
+    name: Build macOS DMG
     runs-on: macos-15
     steps:
       - name: Checkout
@@ -37,68 +37,114 @@ jobs:
         run: |
           brew install xcodegen || true
 
+      - name: Import Developer ID certificate
+        env:
+          SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_CODE_SIGN_IDENTITY }}
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_CERTIFICATE_P12_BASE64"
+          test -n "$SIGNING_CERTIFICATE_PASSWORD"
+          test -n "$SIGNING_IDENTITY"
+          test -n "$DEVELOPMENT_TEAM"
+          test -n "$NOTARY_KEY_BASE64"
+          test -n "$NOTARY_KEY_ID"
+          test -n "$NOTARY_ISSUER_ID"
+          KEYCHAIN_PATH="$RUNNER_TEMP/kumo-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)$(uuidgen)"
+          CERTIFICATE_PATH="$RUNNER_TEMP/kumo-signing.p12"
+          printf '%s' "$SIGNING_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep -F "$SIGNING_IDENTITY" \
+            | grep -F 'Developer ID Application:' \
+            | grep -F "($DEVELOPMENT_TEAM)"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+          chmod 600 "$NOTARY_KEY_PATH"
+          echo "NOTARY_KEY_PATH=$NOTARY_KEY_PATH" >> "$GITHUB_ENV"
+
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
         run: |
-          if [ -n "${GITHUB_REF_NAME:-}" ]; then
-            # Push event: use the tag as-is
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            INPUT_VER="${{ inputs.version }}"
-            if [[ "$INPUT_VER" == v* ]]; then
-              echo "tag=$INPUT_VER" >> "$GITHUB_OUTPUT"
-              echo "version=${INPUT_VER#v}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          CHANNEL="${INPUT_CHANNEL:-stable}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            if [ "$CHANNEL" = "beta" ]; then
+              TAG="pre-release"
             else
-              echo "tag=$INPUT_VER" >> "$GITHUB_OUTPUT"
-              echo "version=$INPUT_VER" >> "$GITHUB_OUTPUT"
+              TAG="$INPUT_VERSION"
             fi
+          else
+            TAG="$GITHUB_REF_NAME"
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
-          echo "channel=${{ inputs.channel || 'stable' }}" >> "$GITHUB_OUTPUT"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Release version must be numeric x.y.z." >&2; exit 1; }
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build arm64 DMG
         run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64" || {
+            echo "Release jobs must run on an Apple Silicon runner." >&2
+            exit 1
+          }
           VERSION_STR="${{ steps.version.outputs.version }}"
           RELEASE_TAG="${{ steps.version.outputs.tag }}" make release-dmg \
             VERSION="$VERSION_STR" \
             BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
             ARCH=arm64 \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_DEVELOPMENT_TEAM }}" \
+            CODE_SIGN_IDENTITY="${{ secrets.APPLE_CODE_SIGN_IDENTITY }}" \
+            NOTARY_KEY_PATH="$NOTARY_KEY_PATH" \
+            NOTARY_KEY_ID="${{ secrets.APPLE_NOTARY_KEY_ID }}" \
+            NOTARY_ISSUER_ID="${{ secrets.APPLE_NOTARY_ISSUER_ID }}" \
             CHANNEL="${{ steps.version.outputs.channel }}"
-          mkdir -p artifacts/arm64
-          cp -R build/release/* artifacts/arm64/
-
-      - name: Build amd64 DMG
-        run: |
-          rm -rf build/release
-          VERSION_STR="${{ steps.version.outputs.version }}"
-          RELEASE_TAG="${{ steps.version.outputs.tag }}" make release-dmg \
-            VERSION="$VERSION_STR" \
-            BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
-            ARCH=amd64 \
-            CHANNEL="${{ steps.version.outputs.channel }}"
-          mkdir -p artifacts/amd64
-          cp -R build/release/* artifacts/amd64/
+          for binary in \
+            build/Build/Products/Release/Kumo.app/Contents/MacOS/Kumo \
+            build/Build/Products/Release/Kumo.app/Contents/MacOS/KumoService \
+            build/Build/Products/Release/Kumo.app/Contents/Helpers/kumo \
+            build/Build/Products/Release/Kumo.app/Contents/Resources/Kumo_KumoCoreKit.bundle/Contents/Resources/SubStore/node/bin/node; do
+            test "$(lipo -archs "$binary")" = "arm64"
+          done
 
       - name: Collect artifacts
         run: |
           set -euo pipefail
+          rm -rf upload
           mkdir -p upload
-          cp artifacts/arm64/*.dmg upload/
-          cp artifacts/amd64/*.dmg upload/
-          if [ -f artifacts/arm64/latest.yml ]; then
-            cp artifacts/arm64/latest.yml upload/latest.yml
-          else
-            cp artifacts/arm64/latest-arm64.yml upload/latest.yml
-          fi
-          cp artifacts/amd64/latest-amd64.yml upload/latest-amd64.yml
+          DMG_NAME="Kumo-macos-${{ steps.version.outputs.version }}-arm64.dmg"
+          cp "build/release/${DMG_NAME}" upload/
+          cp build/release/latest.yml upload/latest.yml
 
           echo "Collected release assets:"
           ls -lh upload/
 
-          grep -q 'assetName: Kumo-macos-${{ steps.version.outputs.version }}-arm64.dmg' upload/latest.yml
-          grep -q 'assetName: Kumo-macos-${{ steps.version.outputs.version }}-amd64.dmg' upload/latest-amd64.yml
+          grep -q "assetName: ${DMG_NAME}" upload/latest.yml
           grep -q '/download/${{ steps.version.outputs.tag }}/' upload/latest.yml
-          grep -q '/download/${{ steps.version.outputs.tag }}/' upload/latest-amd64.yml
+          test "$(find upload -type f | wc -l | tr -d ' ')" = "2"
+          DMG_SHA256="$(shasum -a 256 "upload/${DMG_NAME}" | awk '{print $1}')"
+          MANIFEST_SHA256="$(awk '$1 == "sha256:" {print $2}' upload/latest.yml)"
+          test -n "$MANIFEST_SHA256"
+          test "$DMG_SHA256" = "$MANIFEST_SHA256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -122,22 +168,29 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
         run: |
-          if [ -n "${GITHUB_REF_NAME:-}" ]; then
-            # Push event: use the tag as-is
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            INPUT_VER="${{ inputs.version }}"
-            if [[ "$INPUT_VER" == v* ]]; then
-              echo "tag=$INPUT_VER" >> "$GITHUB_OUTPUT"
-              echo "version=${INPUT_VER#v}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          CHANNEL="${INPUT_CHANNEL:-stable}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            if [ "$CHANNEL" = "beta" ]; then
+              TAG="pre-release"
             else
-              echo "tag=$INPUT_VER" >> "$GITHUB_OUTPUT"
-              echo "version=$INPUT_VER" >> "$GITHUB_OUTPUT"
+              TAG="$INPUT_VERSION"
             fi
+          else
+            TAG="$GITHUB_REF_NAME"
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
-          echo "channel=${{ inputs.channel || 'stable' }}" >> "$GITHUB_OUTPUT"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Release version must be numeric x.y.z." >&2; exit 1; }
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update release
         env:
@@ -147,20 +200,12 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           VERSION_STR="${{ steps.version.outputs.version }}"
           CHANNEL="${{ steps.version.outputs.channel }}"
-          PRERELEASE_FLAG=""
-          if [ "$CHANNEL" = "beta" ]; then
-            PRERELEASE_FLAG="--prerelease"
-          fi
 
           test -f upload/Kumo-macos-${VERSION_STR}-arm64.dmg
-          test -f upload/Kumo-macos-${VERSION_STR}-amd64.dmg
           test -f upload/latest.yml
-          test -f upload/latest-amd64.yml
 
           grep -q "assetName: Kumo-macos-${VERSION_STR}-arm64.dmg" upload/latest.yml
-          grep -q "assetName: Kumo-macos-${VERSION_STR}-amd64.dmg" upload/latest-amd64.yml
           grep -q "/download/${TAG}/" upload/latest.yml
-          grep -q "/download/${TAG}/" upload/latest-amd64.yml
 
           RELEASE_NOTES=""
           if [ -f CHANGELOG.md ]; then
@@ -179,23 +224,64 @@ jobs:
             RELEASE_NOTES="Release ${TAG}"
           fi
 
-          ASSETS=(
-            upload/Kumo-macos-${VERSION_STR}-arm64.dmg
-            upload/Kumo-macos-${VERSION_STR}-amd64.dmg
-            upload/latest.yml
-            upload/latest-amd64.yml
-          )
+          EXPECTED_DMG="Kumo-macos-${VERSION_STR}-arm64.dmg"
+          DMG_PATH="upload/${EXPECTED_DMG}"
+          MANIFEST_PATH="upload/latest.yml"
+          test "$(find upload -type f | wc -l | tr -d ' ')" = "2"
+          DMG_SHA256="$(sha256sum "$DMG_PATH" | awk '{print $1}')"
+          MANIFEST_SHA256="$(awk '$1 == "sha256:" {print $2}' "$MANIFEST_PATH")"
+          test -n "$MANIFEST_SHA256"
+          test "$DMG_SHA256" = "$MANIFEST_SHA256"
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "Release $TAG exists, uploading assets..."
-            gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            echo "Release $TAG exists; moving it to draft before replacing assets..."
+            gh release edit "$TAG" --draft --repo "$GITHUB_REPOSITORY"
           else
-            echo "Creating release $TAG..."
+            echo "Creating draft release $TAG..."
             gh release create "$TAG" \
-              "${ASSETS[@]}" \
               --title "Kumo ${VERSION_STR}" \
               --notes "$RELEASE_NOTES" \
+              --draft \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft' \
+            | grep -Fxq true
+
+          # Upload the manifest last while the release remains private as a
+          # draft. A failure cannot expose a partially replaced asset set.
+          gh release upload "$TAG" "$DMG_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" "$MANIFEST_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+
+          while IFS= read -r asset; do
+            case "$asset" in
+              "$EXPECTED_DMG"|latest.yml)
+                ;;
+              *)
+                gh release delete-asset "$TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
+                ;;
+            esac
+          done < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+
+          mapfile -t PUBLISHED_ASSETS < <(
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+          )
+          test "${#PUBLISHED_ASSETS[@]}" -eq 2
+          printf '%s\n' "${PUBLISHED_ASSETS[@]}" | grep -Fxq "$EXPECTED_DMG"
+          printf '%s\n' "${PUBLISHED_ASSETS[@]}" | grep -Fxq 'latest.yml'
+
+          # Publishing is the final mutation. Any earlier failure leaves the
+          # release in draft, so incomplete assets never become visible.
+          if [ "$CHANNEL" = "beta" ]; then
+            gh release edit "$TAG" \
               --draft=false \
-              $PRERELEASE_FLAG \
+              --prerelease \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release edit "$TAG" \
+              --draft=false \
+              --prerelease=false \
               --repo "$GITHUB_REPOSITORY"
           fi

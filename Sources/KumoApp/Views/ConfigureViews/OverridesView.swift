@@ -57,15 +57,25 @@ struct OverridesView: View {
             do {
                 let content = try String(contentsOf: url, encoding: .utf8)
                 let fileFormat: OverrideFormat = url.pathExtension.localizedCaseInsensitiveContains("js") ? .javascript : .yaml
-                store.addLocalOverride(name: url.deletingPathExtension().lastPathComponent, format: fileFormat, content: content, isGlobal: isGlobal)
+                let name = url.deletingPathExtension().lastPathComponent
+                Task {
+                    await store.addLocalOverride(
+                        name: name,
+                        format: fileFormat,
+                        content: content,
+                        isGlobal: isGlobal
+                    )
+                }
             } catch {
                 store.errorMessage = error.localizedDescription
             }
         }
         .sheet(item: $editingDraft) { draft in
             OverrideEditorSheet(draft: draft) { editedDraft in
-                store.updateOverride(editedDraft.item, content: editedDraft.content)
                 editingDraft = nil
+                Task {
+                    await store.updateOverride(editedDraft.item, content: editedDraft.content)
+                }
             } onCancel: {
                 editingDraft = nil
             }
@@ -73,13 +83,15 @@ struct OverridesView: View {
         .sheet(item: $newDraft) { draft in
             NewOverrideSheet(draft: draft) { editedDraft in
                 let template = editedDraft.format == .yaml ? "# Kumo YAML override\n" : "// Kumo JavaScript override\n"
-                store.addLocalOverride(
-                    name: editedDraft.name,
-                    format: editedDraft.format,
-                    content: template,
-                    isGlobal: editedDraft.isGlobal
-                )
                 newDraft = nil
+                Task {
+                    await store.addLocalOverride(
+                        name: editedDraft.name,
+                        format: editedDraft.format,
+                        content: template,
+                        isGlobal: editedDraft.isGlobal
+                    )
+                }
             } onCancel: {
                 newDraft = nil
             }
@@ -95,8 +107,10 @@ struct OverridesView: View {
             presenting: deletingOverride
         ) { item in
             Button(String(localized: "Delete \(item.name)"), role: .destructive) {
-                store.deleteOverride(item)
                 deletingOverride = nil
+                Task {
+                    await store.deleteOverride(item)
+                }
             }
             Button(String(localized: "Cancel"), role: .cancel) {
                 deletingOverride = nil

@@ -2,6 +2,39 @@ import AppKit
 import SwiftUI
 import KumoCoreKit
 
+enum KumoAppLaunchMode {
+    static let isolatedSmokeTestRootEnvironmentKey = "KUMO_ISOLATED_APP_TEST_ROOT"
+
+    static var isolatedSmokeTestRoot: URL? {
+#if DEBUG
+        guard let path = ProcessInfo.processInfo.environment[isolatedSmokeTestRootEnvironmentKey],
+              !path.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+#else
+        return nil
+#endif
+    }
+
+    static var isIsolatedSmokeTest: Bool {
+        isolatedSmokeTestRoot != nil
+    }
+
+    static func makeController(isolatedRoot: URL? = isolatedSmokeTestRoot) -> KumoController {
+        guard let root = isolatedRoot else { return KumoController() }
+        return KumoController(paths: KumoPaths(
+            applicationSupportDirectory: root.appendingPathComponent("user", isDirectory: true),
+            privilegedRuntimeRootDirectory: root.appendingPathComponent("run", isDirectory: true),
+            privilegedServiceSupportDirectory: root.appendingPathComponent("service", isDirectory: true),
+            serviceExecutableFile: root.appendingPathComponent("system/KumoService"),
+            serviceLaunchDaemonPlistFile: root.appendingPathComponent(
+                "system/io.kumo.KumoService.plist"
+            )
+        ))
+    }
+}
+
 @main
 struct KumoApp: App {
     @State private var store: KumoAppStore
@@ -11,7 +44,10 @@ struct KumoApp: App {
     @NSApplicationDelegateAdaptor(KumoAppDelegate.self) private var appDelegate
 
     init() {
-        let appStore = KumoAppStore()
+        let appStore = KumoAppStore(
+            controller: KumoAppLaunchMode.makeController(),
+            appNotificationCoordinator: KumoAppLaunchMode.isIsolatedSmokeTest ? nil : .shared
+        )
         let prefs = appStore.controller.userPreferences()
         let locManager = LocalizationManager(preferences: prefs)
         appStore.localizationManager = locManager
@@ -54,7 +90,7 @@ struct KumoApp: App {
                 .disabled(store.isLoading || store.status.state == .running || store.status.state == .starting)
 
                 Button(String(localized: "Stop Kumo")) {
-                    store.stopCore()
+                    Task { await store.stopCore() }
                 }
                 .keyboardShortcut(".", modifiers: .command)
                 .disabled(store.isLoading || store.status.state != .running)
@@ -176,7 +212,9 @@ private struct KumoRootView: View {
                 } openAboutWindow: {
                     openWindow(id: "about")
                 }
-                store.startUpdatePolling()
+                if !KumoAppLaunchMode.isIsolatedSmokeTest {
+                    store.startUpdatePolling()
+                }
             }
     }
 }

@@ -125,7 +125,15 @@ public struct MihomoControllerClient: Sendable {
     public func groupDelay(group: ProxyGroup) async throws -> [ProxyNode] {
         var nodes: [ProxyNode] = []
         for proxy in group.proxies {
-            let delay = try? await proxyDelay(proxy: proxy.name, testURL: group.testURL)
+            try Task.checkCancellation()
+            let delay: Int?
+            do {
+                delay = try await proxyDelay(proxy: proxy.name, testURL: group.testURL)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                delay = nil
+            }
             nodes.append(ProxyNode(name: proxy.name, type: proxy.type, delay: delay ?? proxy.delay))
         }
         return nodes
@@ -184,6 +192,33 @@ public struct MihomoControllerClient: Sendable {
 
     public func upgradeGeoData() async throws {
         _ = try await sendJSON("/upgrade/geo", method: "POST")
+    }
+
+    /// Applies one runtime-only mutation to the controller. Runtime authority,
+    /// generation validation, and serialization stay outside this transport
+    /// mapper in `RuntimeBackend` and the privileged Helper.
+    func apply(_ mutation: RuntimeMutation) async throws {
+        switch mutation {
+        case .setMode(let mode):
+            try await setMode(mode)
+            guard try await currentMode() == mode else {
+                throw KumoError.commandFailed("Mihomo did not confirm the requested mode.")
+            }
+        case let .selectProxy(group, name):
+            try await selectProxy(group: group, name: name)
+        case let .setRuleEnabled(index, isEnabled):
+            try await setRulesDisabled([index: !isEnabled])
+        case .closeConnection(let id):
+            try await closeConnection(id: id)
+        case .closeConnections(let matchingProxy):
+            try await closeConnections(matchingProxy: matchingProxy)
+        case .updateProxyProvider(let name):
+            try await updateProxyProvider(name: name)
+        case .updateRuleProvider(let name):
+            try await updateRuleProvider(name: name)
+        case .upgradeGeoData:
+            try await upgradeGeoData()
+        }
     }
 
     public func logStream(level: String = "info") -> AsyncThrowingStream<LogEntry, Error> {
@@ -296,6 +331,7 @@ public struct MihomoControllerClient: Sendable {
     ) async throws -> Data {
         var request = URLRequest(url: url(path: path, query: query))
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 15
         if !endpoint.secret.isEmpty {
             request.setValue("Bearer \(endpoint.secret)", forHTTPHeaderField: "Authorization")

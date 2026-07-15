@@ -33,7 +33,7 @@ extension KumoCommand {
             if core == nil {
                 try await installManagedCoreIfNeeded()
             }
-            let status = try CLIRuntime.current.controller.start(corePath: core)
+            let status = try await CLIRuntime.current.controller.startAndWait(corePath: core)
             CLIRuntime.current.write(status) { "started pid=\($0.pid.map(String.init) ?? "-")" }
         }
     }
@@ -45,7 +45,7 @@ extension KumoCommand {
 
         mutating func run() async throws {
             try options.install()
-            let status = try CLIRuntime.current.controller.stop()
+            let status = try await CLIRuntime.current.controller.stopSafely()
             CLIRuntime.current.write(status) { _ in "stopped" }
         }
     }
@@ -62,7 +62,7 @@ extension KumoCommand {
             if core == nil {
                 try await installManagedCoreIfNeeded()
             }
-            let status = try CLIRuntime.current.controller.restart(corePath: core)
+            let status = try await CLIRuntime.current.controller.restartAndWait(corePath: core)
             CLIRuntime.current.write(status) { "restarted pid=\($0.pid.map(String.init) ?? "-")" }
         }
     }

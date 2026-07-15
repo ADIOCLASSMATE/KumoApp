@@ -70,20 +70,11 @@ public struct AppUpdateManager: Sendable {
         channel: AppUpdateChannel,
         repository: String = defaultRepository
     ) -> URL {
-        let archSuffix: String
-        #if arch(arm64)
-        archSuffix = ""
-        #elseif arch(x86_64)
-        archSuffix = "-amd64"
-        #else
-        archSuffix = ""
-        #endif
-
         switch channel {
         case .stable:
-            return URL(string: "https://github.com/\(repository)/releases/latest/download/latest\(archSuffix).yml")!
+            return URL(string: "https://github.com/\(repository)/releases/latest/download/latest.yml")!
         case .beta:
-            return URL(string: "https://github.com/\(repository)/releases/download/pre-release/latest\(archSuffix).yml")!
+            return URL(string: "https://github.com/\(repository)/releases/download/pre-release/latest.yml")!
         }
     }
 

@@ -2,10 +2,8 @@ import AppKit
 import SwiftUI
 import KumoCoreKit
 
-/// First-run setup sheet that walks the user through optional helpers:
-/// installing the `kumo` CLI shim and registering the bundled Agent Skill
-/// in supported coding agents. Designed so every step can be skipped — the
-/// user always ends on `done` and the completion flag is persisted there.
+/// First-run setup sheet that installs the required privileged Helper before
+/// offering the optional CLI shim and bundled Agent Skill.
 ///
 /// Visual language follows the rest of the app: Liquid Glass surfaces via
 /// `kumoGlassCard` / `kumoInteractiveGlass`, native macOS controls, and the
@@ -16,6 +14,9 @@ struct OnboardingView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var step: OnboardingStep = .welcome
+    @State private var helperStatus = ServiceModeStatus()
+    @State private var helperBusy = false
+    @State private var helperErrorMessage: String?
     @State private var cliStatus = CLILinkStatus(
         state: .notInstalled,
         targetPath: CLILinkInstaller.defaultTargetPath,
@@ -71,6 +72,12 @@ struct OnboardingView: View {
         switch step {
         case .welcome:
             WelcomeStepView()
+        case .helper:
+            HelperStepView(
+                status: helperStatus,
+                isBusy: helperBusy,
+                errorMessage: helperErrorMessage
+            )
         case .cli:
             CLIStepView(
                 status: cliStatus,
@@ -86,6 +93,7 @@ struct OnboardingView: View {
             )
         case .done:
             DoneStepView(
+                helperReady: helperStatus.isAvailable,
                 cliInstalled: cliWasInstalled,
                 installedSkillTargets: installedSkillTargets
             )
@@ -97,6 +105,10 @@ struct OnboardingView: View {
     private var primaryButtonTitle: String {
         switch step {
         case .welcome: "Continue"
+        case .helper:
+            helperStatus.isAvailable
+                ? "Continue"
+                : (helperStatus.requiresRepair ? "Repair Helper" : "Install Helper")
         case .cli: cliStatus.isInstalled ? "Continue" : "Install"
         case .skills: skillSelection.isEmpty ? "Continue" : "Install Selected"
         case .done: "Finish"
@@ -107,6 +119,8 @@ struct OnboardingView: View {
         switch step {
         case .welcome:
             return false
+        case .helper:
+            return helperBusy
         case .cli:
             if cliStatus.isInstalled { return cliBusy }
             return cliBusy || cliStatus.state == .bundledCLIMissing
@@ -118,7 +132,9 @@ struct OnboardingView: View {
     }
 
     private var primaryIsBusy: Bool {
-        (step == .cli && cliBusy) || (step == .skills && skillBusy)
+        (step == .helper && helperBusy)
+            || (step == .cli && cliBusy)
+            || (step == .skills && skillBusy)
     }
 
     // MARK: - Actions
@@ -131,7 +147,9 @@ struct OnboardingView: View {
     private func handleSkip() {
         switch step {
         case .welcome:
-            step = .cli
+            step = .helper
+        case .helper:
+            break
         case .cli:
             cliErrorMessage = nil
             step = .skills
@@ -148,7 +166,13 @@ struct OnboardingView: View {
     private func handlePrimary() {
         switch step {
         case .welcome:
-            step = .cli
+            step = .helper
+        case .helper:
+            if helperStatus.isAvailable {
+                step = .cli
+                return
+            }
+            Task { await installHelper() }
         case .cli:
             if cliStatus.isInstalled {
                 cliWasInstalled = true
@@ -171,8 +195,32 @@ struct OnboardingView: View {
     // MARK: - Async state loading
 
     private func loadInitialState() async {
+        refreshHelperStatus()
+        if store.preferences.hasCompletedOnboarding, !helperStatus.isAvailable {
+            step = .helper
+        }
         refreshCLIStatus()
         await refreshSkillStatuses()
+    }
+
+    private func refreshHelperStatus() {
+        store.refreshServiceModeStatus()
+        helperStatus = store.serviceModeStatus
+    }
+
+    private func installHelper() async {
+        guard !helperBusy else { return }
+        helperBusy = true
+        helperErrorMessage = nil
+        defer { helperBusy = false }
+
+        await store.installServiceMode()
+        helperStatus = store.serviceModeStatus
+        helperErrorMessage = store.errorMessage
+        if helperStatus.isAvailable {
+            helperErrorMessage = nil
+            step = .cli
+        }
     }
 
     private func refreshCLIStatus() {
@@ -243,6 +291,7 @@ struct OnboardingView: View {
 
 enum OnboardingStep: Int, CaseIterable, Identifiable {
     case welcome
+    case helper
     case cli
     case skills
     case done
@@ -252,6 +301,7 @@ enum OnboardingStep: Int, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .welcome: "Welcome to Kumo"
+        case .helper: "Kumo Helper"
         case .cli: "Command Line Tool"
         case .skills: "Agent Skill"
         case .done: "All Set"
@@ -261,7 +311,9 @@ enum OnboardingStep: Int, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .welcome:
-            "A native macOS Mihomo client. Take a moment to set up optional helpers."
+            "Install the runtime service, then choose any optional integrations you want."
+        case .helper:
+            "Kumo Helper owns Mihomo and system proxy changes so profile switches stay consistent."
         case .cli:
             "Install the kumo command so scripts and AI agents can drive Kumo from the terminal."
         case .skills:
@@ -274,10 +326,15 @@ enum OnboardingStep: Int, CaseIterable, Identifiable {
     var previous: OnboardingStep? {
         switch self {
         case .welcome: nil
-        case .cli: .welcome
+        case .helper: .welcome
+        case .cli: .helper
         case .skills: .cli
         case .done: .skills
         }
+    }
+
+    var allowsSkip: Bool {
+        self == .cli || self == .skills
     }
 }
 
@@ -346,7 +403,7 @@ private struct OnboardingFooter: View {
 
             Spacer()
 
-            if step != .welcome, step != .done {
+            if step.allowsSkip {
                 Button(String(localized: "Skip"), action: onSkip)
             }
 
@@ -379,6 +436,11 @@ private struct WelcomeStepView: View {
 
     private let features: [Feature] = [
         Feature(
+            symbol: "checkmark.shield",
+            title: "One runtime owner",
+            description: "Install Kumo Helper so the app, CLI, and Mihomo always agree on the active profile."
+        ),
+        Feature(
             symbol: "terminal",
             title: "Drive Kumo from the terminal",
             description: "Use the kumo CLI from scripts, CI, or coding agents."
@@ -387,11 +449,6 @@ private struct WelcomeStepView: View {
             symbol: "sparkles",
             title: "Agent Skill ready to install",
             description: "Register the bundled Kumo skill in Cursor, Claude Code, Codex, and more."
-        ),
-        Feature(
-            symbol: "gearshape.2",
-            title: "Everything is optional",
-            description: "You can skip any step now and revisit them from Settings later."
         )
     ]
 
@@ -429,6 +486,86 @@ private struct WelcomeStepView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .kumoGlassCard(cornerRadius: 14, tint: .accentColor.opacity(0.04))
         }
+    }
+}
+
+private struct HelperStepView: View {
+    let status: ServiceModeStatus
+    let isBusy: Bool
+    let errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: statusSymbol)
+                    .font(.title2)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(statusTint)
+                    .frame(width: 32)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(statusTitle)
+                        .font(.headline)
+                    Text(statusDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .kumoGlassCard(cornerRadius: 14, tint: statusTint.opacity(0.08))
+
+            Label(
+                "macOS asks for administrator authorization to install the signed privileged service.",
+                systemImage: "lock.shield"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var statusTitle: String {
+        if status.isAvailable { return "Helper ready" }
+        if status.requiresRepair { return "Repair required" }
+        if status.isInstalled { return "Helper unavailable" }
+        return "Helper required"
+    }
+
+    private var statusDetail: String {
+        if let message = status.message, !message.isEmpty { return message }
+        if status.isAvailable {
+            return "The authenticated Helper is running and compatible."
+        }
+        if status.requiresRepair {
+            return "Kumo found an incomplete or incompatible Helper installation."
+        }
+        return "Install the Helper before starting Mihomo."
+    }
+
+    private var statusSymbol: String {
+        if status.isAvailable { return "checkmark.shield.fill" }
+        if status.requiresRepair { return "exclamationmark.shield.fill" }
+        return "shield"
+    }
+
+    private var statusTint: Color {
+        if status.isAvailable { return .green }
+        if status.requiresRepair { return .orange }
+        return .accentColor
     }
 }
 
@@ -678,14 +815,18 @@ private struct SkillTargetRow: View {
 }
 
 private struct DoneStepView: View {
+    let helperReady: Bool
     let cliInstalled: Bool
     let installedSkillTargets: [AgentSkillsTarget]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            heroCheckmark
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.top, 4)
+            SummaryRow(
+                symbol: helperReady ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                tint: helperReady ? .green : .orange,
+                title: "Kumo Helper",
+                detail: helperReady ? "Installed and ready." : "Installation still needs attention."
+            )
 
             SummaryRow(
                 symbol: cliInstalled ? "checkmark.seal.fill" : "ellipsis.circle.fill",
@@ -712,16 +853,6 @@ private struct DoneStepView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-    }
-
-    @ViewBuilder
-    private var heroCheckmark: some View {
-        Image(systemName: "checkmark")
-            .font(.system(size: 30, weight: .semibold))
-            .foregroundStyle(.green)
-            .frame(width: 64, height: 64)
-            .kumoGlassCard(cornerRadius: 32, tint: .green.opacity(0.10))
-            .accessibilityHidden(true)
     }
 
     private struct SummaryRow: View {

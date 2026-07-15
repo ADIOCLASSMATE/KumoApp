@@ -49,11 +49,15 @@ let package = Package(
         ),
         .testTarget(
             name: "KumoCoreTests",
-            dependencies: ["KumoCoreKit"]
+            dependencies: ["KumoCoreKit", "Yams"]
         ),
         .testTarget(
             name: "KumoCLITests",
             dependencies: ["KumoCLIKit", "KumoCoreKit"]
+        ),
+        .testTarget(
+            name: "KumoAppTests",
+            dependencies: ["KumoApp", "KumoCoreKit"]
         )
     ]
 )

@@ -2,8 +2,18 @@ import Foundation
 
 public struct KumoPaths: Sendable {
     public var applicationSupportDirectory: URL
+    public var privilegedRuntimeRootDirectory: URL
+    public var privilegedServiceSupportDirectory: URL
+    private var serviceExecutableFileOverride: URL?
+    private var serviceLaunchDaemonPlistFileOverride: URL?
 
-    public init(applicationSupportDirectory: URL? = nil) {
+    public init(
+        applicationSupportDirectory: URL? = nil,
+        privilegedRuntimeRootDirectory: URL? = nil,
+        privilegedServiceSupportDirectory: URL? = nil,
+        serviceExecutableFile: URL? = nil,
+        serviceLaunchDaemonPlistFile: URL? = nil
+    ) {
         if let applicationSupportDirectory {
             self.applicationSupportDirectory = applicationSupportDirectory
         } else {
@@ -13,6 +23,12 @@ public struct KumoPaths: Sendable {
             ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
             self.applicationSupportDirectory = baseDirectory.appendingPathComponent("Kumo", isDirectory: true)
         }
+        self.privilegedRuntimeRootDirectory = privilegedRuntimeRootDirectory
+            ?? URL(fileURLWithPath: "/private/var/run/io.kumo", isDirectory: true)
+        self.privilegedServiceSupportDirectory = privilegedServiceSupportDirectory
+            ?? URL(fileURLWithPath: "/Library/Application Support/io.kumo.KumoService", isDirectory: true)
+        self.serviceExecutableFileOverride = serviceExecutableFile
+        self.serviceLaunchDaemonPlistFileOverride = serviceLaunchDaemonPlistFile
     }
 
     public var profilesDirectory: URL {
@@ -87,6 +103,65 @@ public struct KumoPaths: Sendable {
         managedCoreDirectory.appendingPathComponent("mihomo")
     }
 
+    public func privilegedManagedCoreExecutable(userID: UInt32) -> URL {
+        privilegedServiceSupportDirectory
+            .appendingPathComponent("users", isDirectory: true)
+            .appendingPathComponent(String(userID), isDirectory: true)
+            .appendingPathComponent("mihomo")
+    }
+
+    public func privilegedRuntimeDirectory(userID: UInt32) -> URL {
+        privilegedRuntimeRootDirectory
+            .appendingPathComponent(String(userID), isDirectory: true)
+    }
+
+    public func privilegedRuntimeWorkDirectory(userID: UInt32) -> URL {
+        privilegedRuntimeDirectory(userID: userID)
+            .appendingPathComponent("work", isDirectory: true)
+    }
+
+    public func privilegedRuntimeLogsDirectory(userID: UInt32) -> URL {
+        privilegedRuntimeDirectory(userID: userID)
+            .appendingPathComponent("logs", isDirectory: true)
+    }
+
+    public func privilegedCoreInstancesDirectory(userID: UInt32) -> URL {
+        privilegedRuntimeDirectory(userID: userID)
+            .appendingPathComponent("instances", isDirectory: true)
+    }
+
+    public func privilegedServiceSocketFile(userID: UInt32) -> URL {
+        privilegedRuntimeDirectory(userID: userID)
+            .appendingPathComponent("kumo-service.sock")
+    }
+
+    public func privilegedServiceCredentialsFile(userID: UInt32) -> URL {
+        privilegedServiceUserDirectory(userID: userID)
+            .appendingPathComponent("service-credentials.json")
+    }
+
+    public func privilegedServiceUserDirectory(userID: UInt32) -> URL {
+        privilegedServiceSupportDirectory
+            .appendingPathComponent("users", isDirectory: true)
+            .appendingPathComponent(String(userID), isDirectory: true)
+    }
+
+    /// Root-owned crash/reboot journal for the macOS proxy state. Unlike the
+    /// runtime files under `/private/var/run`, this must survive a reboot so a
+    /// stale loopback proxy can always be restored or disabled.
+    public func privilegedSystemProxyJournalFile(userID: UInt32) -> URL {
+        privilegedServiceUserDirectory(userID: userID)
+            .appendingPathComponent("system-proxy-state.json")
+    }
+
+    public var privilegedServiceLogFile: URL {
+        privilegedServiceSupportDirectory.appendingPathComponent("KumoService.log")
+    }
+
+    public var serviceInstallationManifestFile: URL {
+        privilegedServiceSupportDirectory.appendingPathComponent("installation-manifest.json")
+    }
+
     public var stateFile: URL {
         applicationSupportDirectory.appendingPathComponent("state.json")
     }
@@ -101,6 +176,22 @@ public struct KumoPaths: Sendable {
 
     public var corePIDFile: URL {
         workDirectory.appendingPathComponent("core.pid")
+    }
+
+    public var coreInstanceFile: URL {
+        workDirectory.appendingPathComponent("core-instance.json")
+    }
+
+    public var coreLifecycleLockFile: URL {
+        workDirectory.appendingPathComponent("core-lifecycle.lock")
+    }
+
+    public var profileOperationLockFile: URL {
+        applicationSupportDirectory.appendingPathComponent("profile-operation.lock")
+    }
+
+    public var coreInstancesDirectory: URL {
+        workDirectory.appendingPathComponent("instances", isDirectory: true)
     }
 
     public var coreLogFile: URL {
@@ -128,11 +219,13 @@ public struct KumoPaths: Sendable {
     }
 
     public var serviceExecutableFile: URL {
-        URL(fileURLWithPath: "/Library/PrivilegedHelperTools/io.kumo.KumoService")
+        serviceExecutableFileOverride
+            ?? URL(fileURLWithPath: "/Library/PrivilegedHelperTools/io.kumo.KumoService")
     }
 
     public var serviceLaunchDaemonPlistFile: URL {
-        URL(fileURLWithPath: "/Library/LaunchDaemons/io.kumo.KumoService.plist")
+        serviceLaunchDaemonPlistFileOverride
+            ?? URL(fileURLWithPath: "/Library/LaunchDaemons/io.kumo.KumoService.plist")
     }
 
     public var subStoreLogFile: URL {
@@ -158,6 +251,10 @@ public struct KumoPaths: Sendable {
         )
         try FileManager.default.createDirectory(
             at: workDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: coreInstancesDirectory,
             withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(

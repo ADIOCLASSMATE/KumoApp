@@ -220,7 +220,7 @@ final class KumoStatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleCore() {
         guard let store else { return }
         if store.status.state == .running {
-            store.stopCore()
+            Task { await store.stopCore() }
         } else {
             Task { await store.startCore() }
         }

@@ -73,6 +73,37 @@ public struct KumoServiceTransportResponse: Codable, Equatable, Sendable {
     }
 }
 
+@_spi(KumoService)
+public struct KumoServiceReplayCache: Sendable {
+    private var acceptedAtByNonce: [String: Date] = [:]
+    private let maximumEntries: Int
+
+    public init(maximumEntries: Int = 4_096) {
+        self.maximumEntries = max(1, maximumEntries)
+    }
+
+    public var count: Int { acceptedAtByNonce.count }
+
+    mutating func prune(now: Date, allowedClockSkew: TimeInterval) {
+        let oldestAcceptedDate = now.addingTimeInterval(-allowedClockSkew)
+        acceptedAtByNonce = acceptedAtByNonce.filter { $0.value >= oldestAcceptedDate }
+        if acceptedAtByNonce.count >= maximumEntries {
+            let overflow = acceptedAtByNonce.count - maximumEntries + 1
+            for (nonce, _) in acceptedAtByNonce.sorted(by: { $0.value < $1.value }).prefix(overflow) {
+                acceptedAtByNonce.removeValue(forKey: nonce)
+            }
+        }
+    }
+
+    func contains(_ nonce: String) -> Bool {
+        acceptedAtByNonce[nonce] != nil
+    }
+
+    mutating func insert(_ nonce: String, acceptedAt: Date) {
+        acceptedAtByNonce[nonce] = acceptedAt
+    }
+}
+
 public struct KumoServiceRequestSigner: Sendable {
     public var credentials: KumoServiceCredentials
 
@@ -172,6 +203,33 @@ public struct KumoServiceRequestSigner: Sendable {
         return true
     }
 
+    @_spi(KumoService)
+    public static func validate(
+        _ request: KumoServiceSignedRequest,
+        credentials: KumoServiceCredentials,
+        now: Date = Date(),
+        allowedClockSkew: TimeInterval = 300,
+        replayCache: inout KumoServiceReplayCache
+    ) -> Bool {
+        replayCache.prune(now: now, allowedClockSkew: allowedClockSkew)
+        guard let nonce = request.headers["X-Kumo-Nonce"],
+              !replayCache.contains(nonce) else {
+            return false
+        }
+        var acceptedNonces = Set<String>()
+        guard validate(
+            request,
+            credentials: credentials,
+            now: now,
+            allowedClockSkew: allowedClockSkew,
+            seenNonces: &acceptedNonces
+        ) else {
+            return false
+        }
+        replayCache.insert(nonce, acceptedAt: now)
+        return true
+    }
+
     private static func canonicalString(
         timestamp: String,
         nonce: String,
@@ -205,7 +263,7 @@ public struct KumoServiceRequestSigner: Sendable {
     }
 }
 
-public struct KumoServiceClient: Sendable {
+struct KumoServiceClient: Sendable {
     public var endpoint: KumoServiceEndpoint
     public var signer: KumoServiceRequestSigner
 
@@ -222,58 +280,112 @@ public struct KumoServiceClient: Sendable {
         signedRequest(method: "GET", path: "/service/status")
     }
 
-    public func installServiceRequest() -> KumoServiceSignedRequest {
-        signedRequest(method: "POST", path: "/service/install")
-    }
-
-    public func uninstallServiceRequest() -> KumoServiceSignedRequest {
-        signedRequest(method: "POST", path: "/service/uninstall")
+    public func handshakeRequest() -> KumoServiceSignedRequest {
+        signedRequest(method: "GET", path: "/service/handshake")
     }
 
     public func tunStatusRequest() -> KumoServiceSignedRequest {
         signedRequest(method: "GET", path: "/tun/status")
     }
 
-    public func setTunEnabledRequest(_ isEnabled: Bool) -> KumoServiceSignedRequest {
-        let path = isEnabled ? "/tun/enable" : "/tun/disable"
-        return signedRequest(method: "POST", path: path)
-    }
-
-    public func applyTunSettingsRequest(_ settings: TunSettings) throws -> KumoServiceSignedRequest {
-        let body = try JSONEncoder().encode(settings)
-        return signedRequest(method: "POST", path: "/tun/settings", body: body)
-    }
-
     public func statusRequest() -> KumoServiceSignedRequest {
         signedRequest(method: "GET", path: "/status")
     }
 
-    public func startCoreRequest() -> KumoServiceSignedRequest {
-        signedRequest(method: "POST", path: "/core/start")
+    public func startCoreRequest(_ launch: CoreRuntimeLaunchRequest) throws -> KumoServiceSignedRequest {
+        signedRequest(
+            method: "POST",
+            path: "/core/start",
+            body: try JSONEncoder().encode(launch)
+        )
     }
 
-    public func stopCoreRequest() -> KumoServiceSignedRequest {
-        signedRequest(method: "POST", path: "/core/stop")
+    public func installCoreRequest() -> KumoServiceSignedRequest {
+        signedRequest(method: "POST", path: "/core/install")
     }
 
-    public func restartCoreRequest() -> KumoServiceSignedRequest {
-        signedRequest(method: "POST", path: "/core/restart")
+    public func coreCandidatesRequest() -> KumoServiceSignedRequest {
+        signedRequest(method: "GET", path: "/core/candidates")
+    }
+
+    public func stopCoreRequest(_ request: RuntimeStopRequest) throws -> KumoServiceSignedRequest {
+        signedRequest(
+            method: "POST",
+            path: "/core/stop",
+            body: try JSONEncoder().encode(request)
+        )
+    }
+
+    public func restartCoreRequest(_ launch: CoreRuntimeLaunchRequest) throws -> KumoServiceSignedRequest {
+        signedRequest(
+            method: "POST",
+            path: "/core/restart",
+            body: try JSONEncoder().encode(launch)
+        )
+    }
+
+    public func recentLogsRequest(limit: Int) -> KumoServiceSignedRequest {
+        signedRequest(method: "GET", path: "/logs/recent/\(max(0, min(limit, 2_000)))")
+    }
+
+    public func runtimeEventsRequest(limit: Int) -> KumoServiceSignedRequest {
+        signedRequest(method: "GET", path: "/runtime/events/\(max(0, min(limit, 2_000)))")
+    }
+
+    public func runtimeMutationRequest(
+        _ mutation: RuntimeMutationRequest
+    ) throws -> KumoServiceSignedRequest {
+        signedRequest(
+            method: "POST",
+            path: "/runtime/mutate",
+            body: try JSONEncoder().encode(mutation)
+        )
     }
 
     public func systemProxyStatusRequest() -> KumoServiceSignedRequest {
         signedRequest(method: "GET", path: "/sysproxy/status")
     }
 
-    public func setSystemProxyEnabledRequest(_ isEnabled: Bool) -> KumoServiceSignedRequest {
+    public func setSystemProxyEnabledRequest(
+        _ isEnabled: Bool,
+        settings: SystemProxySettings?,
+        expectedGeneration: RuntimeGenerationExpectation? = nil
+    ) throws -> KumoServiceSignedRequest {
         let path = isEnabled ? "/sysproxy/enable" : "/sysproxy/disable"
-        return signedRequest(method: "POST", path: path)
+        let body: Data
+        if isEnabled {
+            guard let settings, let expectedGeneration else {
+                throw KumoError.invalidArguments(
+                    "Enabling System Proxy requires settings and an exact runtime generation."
+                )
+            }
+            _ = try expectedGeneration.requiredMatchingGeneration()
+            body = try JSONEncoder().encode(RuntimeSystemProxyEnableRequest(
+                settings: settings,
+                expectedGeneration: expectedGeneration
+            ))
+        } else {
+            body = Data()
+        }
+        return signedRequest(
+            method: "POST",
+            path: path,
+            body: body
+        )
     }
 
     public func send(_ request: KumoServiceSignedRequest) throws -> KumoServiceTransportResponse {
         let transportRequest = KumoServiceTransportRequest(request: request)
         let payload = try JSONEncoder().encode(transportRequest)
-        let responseData = try send(payload: payload, toSocketAt: endpoint.socketPath)
+        let responseData = try send(
+            payload: payload,
+            toSocketAt: endpoint.socketPath,
+            timeoutSeconds: timeoutSeconds(for: request.path)
+        )
         let response = try JSONDecoder().decode(KumoServiceTransportResponse.self, from: responseData)
+        if response.status == 409 {
+            throw KumoError.runtimeGenerationConflict
+        }
         guard (200..<300).contains(response.status) else {
             throw KumoError.serviceUnavailable(response.error ?? "Kumo service returned status \(response.status).")
         }
@@ -289,15 +401,27 @@ public struct KumoServiceClient: Sendable {
     }
 
     public func ping() -> Bool {
-        (try? send(serviceStatusRequest())) != nil
+        (try? compatibleHandshake()) != nil
     }
 
-    private func send(payload: Data, toSocketAt path: String) throws -> Data {
+    public func compatibleHandshake() throws -> KumoServiceHandshake {
+        let handshake = try sendDecodable(handshakeRequest(), as: KumoServiceHandshake.self)
+        guard handshake.isCompatible else {
+            throw KumoError.serviceUnavailable(
+                "The installed Kumo Helper protocol is incompatible. Repair the Helper before changing the runtime."
+            )
+        }
+        return handshake
+    }
+
+    private func send(payload: Data, toSocketAt path: String, timeoutSeconds: Int) throws -> Data {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else {
             throw KumoError.serviceUnavailable("Unable to create Kumo service socket.")
         }
         defer { close(descriptor) }
+        try KumoSocketSafety.configureNoSigPipe(descriptor)
+        try configureTimeouts(descriptor: descriptor, seconds: timeoutSeconds)
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -338,8 +462,9 @@ public struct KumoServiceClient: Sendable {
                     baseAddress.advanced(by: bytesWritten),
                     data.count - bytesWritten
                 )
+                if result < 0, errno == EINTR { continue }
                 guard result > 0 else {
-                    throw KumoError.serviceUnavailable("Failed to write request to Kumo service.")
+                    throw socketIOError("write request to Kumo service")
                 }
                 bytesWritten += result
             }
@@ -347,6 +472,7 @@ public struct KumoServiceClient: Sendable {
     }
 
     private func readAll(from descriptor: Int32) throws -> Data {
+        let maximumResponseBytes = 64 * 1024 * 1024
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
         while true {
@@ -354,10 +480,73 @@ public struct KumoServiceClient: Sendable {
             if count == 0 {
                 return data
             }
+            if count < 0, errno == EINTR { continue }
             guard count > 0 else {
-                throw KumoError.serviceUnavailable("Failed to read response from Kumo service.")
+                throw socketIOError("read response from Kumo service")
+            }
+            guard data.count + count <= maximumResponseBytes else {
+                throw KumoError.serviceUnavailable("Kumo service response exceeded the 64 MiB limit.")
             }
             data.append(contentsOf: buffer.prefix(count))
+        }
+    }
+
+    private func timeoutSeconds(for path: String) -> Int {
+        switch path {
+        case "/core/install":
+            return 240
+        case "/core/start", "/core/restart":
+            return 60
+        default:
+            return 15
+        }
+    }
+
+    private func configureTimeouts(descriptor: Int32, seconds: Int) throws {
+        var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+        let length = socklen_t(MemoryLayout<timeval>.size)
+        guard withUnsafePointer(to: &timeout, {
+            setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, $0, length)
+        }) == 0,
+        withUnsafePointer(to: &timeout, {
+            setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, $0, length)
+        }) == 0 else {
+            throw socketIOError("configure Kumo service socket timeouts")
+        }
+    }
+
+    private func socketIOError(_ operation: String) -> KumoError {
+        let message: String
+        if errno == EAGAIN || errno == EWOULDBLOCK {
+            message = "Timed out while attempting to \(operation)."
+        } else {
+            message = "Unable to \(operation): \(String(cString: strerror(errno)))."
+        }
+        return .serviceUnavailable(message)
+    }
+}
+
+/// `Darwin.write` raises SIGPIPE by default when the peer closes a Unix
+/// socket. A thrown Swift error cannot catch that signal, so both the app and
+/// Helper must opt every connected descriptor out before writing.
+@_spi(KumoService)
+public enum KumoSocketSafety {
+    public static func configureNoSigPipe(_ descriptor: Int32) throws {
+        var enabled: Int32 = 1
+        let result = withUnsafePointer(to: &enabled) {
+            setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+        guard result == 0 else {
+            let code = errno
+            throw KumoError.serviceUnavailable(
+                "Unable to protect Kumo service socket writes: \(String(cString: strerror(code)))"
+            )
         }
     }
 }

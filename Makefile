@@ -20,15 +20,15 @@ RELEASE_OUTPUT := $(DERIVED_DATA)/release
 DESTINATION ?= platform=macOS
 BUILD_NUMBER ?= 1
 SUBSTORE_RUNTIME_SCRIPT := Scripts/prepare_substore_runtime.sh
+DEVELOPMENT_TEAM ?=
+CODE_SIGN_IDENTITY ?=
+NOTARY_KEY_PATH ?=
+NOTARY_KEY_ID ?=
+NOTARY_ISSUER_ID ?=
 
-# Architecture: arm64 (Apple Silicon, default) or amd64 (Intel)
+# Kumo supports Apple Silicon only.
 ARCH ?= arm64
-
-ifeq ($(ARCH),amd64)
-  XCODE_ARCH := x86_64
-else
-  XCODE_ARCH := arm64
-endif
+XCODE_ARCH := arm64
 
 .DEFAULT_GOAL := help
 
@@ -40,9 +40,13 @@ help: ## Show available commands.
 generate: ## Regenerate the Xcode project from project.yml using XcodeGen.
 	$(XCODEGEN) generate
 
+.PHONY: require-apple-silicon
+require-apple-silicon:
+	@test "$(ARCH)" = "arm64" || { echo "Kumo supports Apple Silicon only; ARCH must be arm64."; exit 1; }
+
 .PHONY: prepare-substore-runtime
-prepare-substore-runtime: ## Download the generated Sub-Store Node runtime into local resources.
-	bash $(SUBSTORE_RUNTIME_SCRIPT)
+prepare-substore-runtime: require-apple-silicon ## Download the generated Sub-Store Node runtime into local resources.
+	SUBSTORE_NODE_ARCH="$(XCODE_ARCH)" bash $(SUBSTORE_RUNTIME_SCRIPT)
 
 .PHONY: app
 app: generate ## Build the Kumo .app bundle in Debug to build/Build/Products/Debug.
@@ -59,10 +63,22 @@ app: generate ## Build the Kumo .app bundle in Debug to build/Build/Products/Deb
 		chmod 755 "$(APP_PATH_DEBUG)/Contents/Helpers/kumo"; \
 	fi
 
+.PHONY: require-release-signing
+require-release-signing:
+	@test -n "$(DEVELOPMENT_TEAM)" || { echo "Set DEVELOPMENT_TEAM to the Apple signing Team ID."; exit 1; }
+	@test -n "$(CODE_SIGN_IDENTITY)" || { echo "Set CODE_SIGN_IDENTITY to a Developer ID Application identity."; exit 1; }
+	@/usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -F "$(CODE_SIGN_IDENTITY)" | /usr/bin/grep -F "Developer ID Application:" | /usr/bin/grep -F "($(DEVELOPMENT_TEAM))" >/dev/null || { echo "CODE_SIGN_IDENTITY must identify an installed Developer ID Application certificate for Team $(DEVELOPMENT_TEAM)."; exit 1; }
+
+.PHONY: require-release-notarization
+require-release-notarization:
+	@test -f "$(NOTARY_KEY_PATH)" || { echo "Set NOTARY_KEY_PATH to an App Store Connect API .p8 key."; exit 1; }
+	@test -n "$(NOTARY_KEY_ID)" || { echo "Set NOTARY_KEY_ID for notarization."; exit 1; }
+	@test -n "$(NOTARY_ISSUER_ID)" || { echo "Set NOTARY_ISSUER_ID for notarization."; exit 1; }
+
 .PHONY: app-release
-app-release: generate ## Build the Kumo .app bundle in Release to build/Build/Products/Release.
-	$(MAKE) prepare-substore-runtime
-	$(XCODEBUILD) -project $(PROJECT) -scheme $(SCHEME_APP) -configuration Release -derivedDataPath $(DERIVED_DATA) build ARCHS=$(XCODE_ARCH) ONLY_ACTIVE_ARCH=NO $(if $(VERSION),MARKETING_VERSION="$(VERSION)" CURRENT_PROJECT_VERSION="$(BUILD_NUMBER)",)
+app-release: require-apple-silicon require-release-signing generate ## Build the signed Kumo .app bundle in Release to build/Build/Products/Release.
+	SUBSTORE_FORCE_REFRESH=1 $(MAKE) prepare-substore-runtime
+	$(XCODEBUILD) -project $(PROJECT) -scheme $(SCHEME_APP) -configuration Release -derivedDataPath $(DERIVED_DATA) build ARCHS=$(XCODE_ARCH) ONLY_ACTIVE_ARCH=NO DEVELOPMENT_TEAM="$(DEVELOPMENT_TEAM)" CODE_SIGN_IDENTITY="$(CODE_SIGN_IDENTITY)" CODE_SIGN_STYLE=Manual $(if $(VERSION),MARKETING_VERSION="$(VERSION)" CURRENT_PROJECT_VERSION="$(BUILD_NUMBER)",)
 	@if [ -x "$(SERVICE_PATH_RELEASE)" ]; then \
 		mkdir -p "$(APP_PATH_RELEASE)/Contents/MacOS"; \
 		cp "$(SERVICE_PATH_RELEASE)" "$(APP_PATH_RELEASE)/Contents/MacOS/KumoService"; \
@@ -73,19 +89,33 @@ app-release: generate ## Build the Kumo .app bundle in Release to build/Build/Pr
 		cp "$(CLI_PATH_RELEASE)" "$(APP_PATH_RELEASE)/Contents/Helpers/kumo"; \
 		chmod 755 "$(APP_PATH_RELEASE)/Contents/Helpers/kumo"; \
 	fi
+	@for binary in \
+		"$(APP_PATH_RELEASE)/Contents/MacOS/Kumo" \
+		"$(APP_PATH_RELEASE)/Contents/MacOS/KumoService" \
+		"$(APP_PATH_RELEASE)/Contents/Helpers/kumo" \
+		"$(APP_PATH_RELEASE)/Contents/Resources/Kumo_KumoCoreKit.bundle/Contents/Resources/SubStore/node/bin/node"; do \
+		test -x "$$binary" || { echo "Required release executable is missing: $$binary"; exit 1; }; \
+		BINARY_ARCHS="$$(/usr/bin/lipo -archs "$$binary")" || exit 1; \
+		test "$$BINARY_ARCHS" = "arm64" || { echo "Release executable is not arm64-only: $$binary ($$BINARY_ARCHS)"; exit 1; }; \
+	done
+	@/usr/bin/codesign --verify --strict --deep --all-architectures "$(APP_PATH_RELEASE)"
+	@for signed_item in "$(APP_PATH_RELEASE)" "$(APP_PATH_RELEASE)/Contents/MacOS/KumoService" "$(APP_PATH_RELEASE)/Contents/Helpers/kumo"; do \
+		SIGNING_INFO="$$(/usr/bin/codesign -dv --verbose=4 "$$signed_item" 2>&1)" || exit 1; \
+		TEAM="$$(printf '%s\n' "$$SIGNING_INFO" | /usr/bin/awk -F= '/^TeamIdentifier=/{print $$2}')"; \
+		AUTHORITY="$$(printf '%s\n' "$$SIGNING_INFO" | /usr/bin/awk -F= '/^Authority=Developer ID Application:/{print $$2; exit}')"; \
+		RUNTIME="$$(printf '%s\n' "$$SIGNING_INFO" | /usr/bin/awk '/^CodeDirectory .*flags=.*\(.*runtime.*\)/{print "runtime"; exit}')"; \
+		test "$$TEAM" = "$(DEVELOPMENT_TEAM)" && test -n "$$AUTHORITY" && test "$$RUNTIME" = "runtime" || { echo "$$signed_item must use hardened-runtime Developer ID Application signing for Team $(DEVELOPMENT_TEAM)."; exit 1; }; \
+	done
 
 .PHONY: require-release-version
 require-release-version:
 	@test -n "$(VERSION)" || { echo "Set VERSION, for example: make release-dmg VERSION=0.0.1"; exit 1; }
+	@[[ "$(VERSION)" =~ ^[0-9]+\.[0-9]+\.[0-9]+$$ ]] || { echo "VERSION must use numeric x.y.z format."; exit 1; }
 
 .PHONY: release-dmg
-release-dmg: require-release-version ## Build release app, DMG, and latest.yml. Requires VERSION=0.0.1.
+release-dmg: require-apple-silicon require-release-version require-release-signing require-release-notarization ## Build release app, notarized DMG, and latest.yml. Requires VERSION=0.0.1.
 	$(MAKE) app-release VERSION="$(VERSION)" BUILD_NUMBER="$(BUILD_NUMBER)" ARCH="$(ARCH)"
-	VERSION="$(VERSION)" CHANNEL="$(CHANNEL)" RELEASE_TAG="$(RELEASE_TAG)" OUTPUT_DIR="$(RELEASE_OUTPUT)" APP_PATH="$(APP_PATH_RELEASE)" ARCH_NAME="$(ARCH)" bash Scripts/make_release_artifacts.sh
-
-.PHONY: release-dmg-amd64
-release-dmg-amd64: require-release-version ## Build release app, DMG, and latest.yml for Intel (amd64). Requires VERSION=0.0.1.
-	$(MAKE) release-dmg VERSION="$(VERSION)" BUILD_NUMBER="$(BUILD_NUMBER)" RELEASE_TAG="$(RELEASE_TAG)" ARCH=amd64
+	VERSION="$(VERSION)" CHANNEL="$(CHANNEL)" RELEASE_TAG="$(RELEASE_TAG)" OUTPUT_DIR="$(RELEASE_OUTPUT)" APP_PATH="$(APP_PATH_RELEASE)" ARCH_NAME="arm64" DEVELOPMENT_TEAM="$(DEVELOPMENT_TEAM)" CODE_SIGN_IDENTITY="$(CODE_SIGN_IDENTITY)" NOTARY_KEY_PATH="$(NOTARY_KEY_PATH)" NOTARY_KEY_ID="$(NOTARY_KEY_ID)" NOTARY_ISSUER_ID="$(NOTARY_ISSUER_ID)" bash Scripts/make_release_artifacts.sh
 
 .PHONY: release-artifacts
 release-artifacts: release-dmg ## Alias for release-dmg.
@@ -139,6 +169,7 @@ xcode-build: app ## Build the KumoApp scheme via xcodebuild.
 
 .PHONY: xcode-test
 xcode-test: ## Run package tests via xcodebuild.
+	$(MAKE) prepare-substore-runtime
 	$(XCODEBUILD) -scheme $(SCHEME_PACKAGE) -destination '$(DESTINATION)' test
 
 .PHONY: swift-build
@@ -156,6 +187,7 @@ test: xcode-test ## Run unit tests with Xcode CLI.
 
 .PHONY: swift-test
 swift-test: ## Run unit tests with SwiftPM.
+	$(MAKE) prepare-substore-runtime
 	$(SWIFT) test
 
 .PHONY: run-cli

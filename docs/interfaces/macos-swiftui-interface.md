@@ -45,6 +45,33 @@ does not stretch the window horizontally.
 
 `KumoAppStore` is an `@Observable` object that bridges SwiftUI state to `KumoCoreKit`. Views should call store methods instead of directly constructing controller clients.
 
+Profile and runtime transitions are generation-scoped. At transition start the
+store cancels traffic/log streams and GeoIP work, clears live nodes,
+connections, rules, and traffic, and exposes `activatingProfileID` for the
+in-progress row. Successful activation or rollback advances the generation a
+second time before reloading controller data. Every async result checks that
+generation before writing observable state, so a response from the former
+profile cannot repopulate nodes or traffic after a switch. Failed profile edits,
+refreshes, deletes, scheduled refreshes, and Core/TUN/DNS/Sniffer applies all
+rehydrate the verified runtime rather than leaving the UI blank or stale.
+Override imports, edits, deletes, and reorders use the same runtime-transition
+rehydration path: their async controller transaction clears stale node and
+traffic data before a live restart, then reloads either the verified candidate
+or the restored previous runtime.
+`OverridesView` shows only global entries plus entries scoped to the selected
+profile. Existing profile-scoped items can be edited, deleted, or reordered
+only from their owning profile. Creating a local override or converting a
+global item to local binds it to the selected profile inside `KumoController`;
+the UI cannot forge another profile ID. Legacy unscoped items are intentionally
+absent from this filtered list; if a migration caller edits one through the
+controller, it is rebound to the selected profile. A global mutation may affect
+every profile, so its transaction structurally preflights all stored profiles
+before the view accepts the change.
+The first App hydration force-reloads any live selected profile before streams
+start, covering a prior crash between profile-file commit and runtime restart.
+Starting a transition also clears delay-test activity so an older task cannot
+leave a permanent spinner.
+
 The main-window mode picker and Start / Stop / Refresh controls live on the
 `NavigationSplitView` **detail** column, not on the split view root. On macOS 26
 the collapsible sidebar retargets unified-toolbar layout during its animation;
@@ -284,20 +311,31 @@ Preferences persist to `~/Library/Application Support/Kumo/preferences.json` via
 
 ## First-Run Onboarding
 
-`OnboardingView` is a four-step sheet attached to `KumoRootView` and gated by
-`UserPreferences.hasCompletedOnboarding`. It walks the user through optional
-helpers without forcing any of them:
+`OnboardingView` is a five-step sheet attached to `KumoRootView` and gated by
+`UserPreferences.hasCompletedOnboarding`. The runtime Helper is required;
+the CLI and Agent Skill integrations remain optional:
 
-1. **Welcome** — short feature summary; users can dismiss with Skip.
-2. **Command Line Tool** — calls `KumoController.cliLinkStatus()` and offers
+1. **Welcome** — short feature and ownership summary.
+2. **Kumo Helper** — shows authenticated installation health and offers
+   `Install Helper` or `Repair Helper`. This step cannot be skipped. A clean
+   first migration installs and authenticates the Helper, normalizes the
+   selected profile, and prepares its managed core before interrupting an
+   existing legacy runtime; it then transfers the runtime and restores System
+   Proxy.
+3. **Command Line Tool** — calls `KumoController.cliLinkStatus()` and offers
    `Install` (or `Remove`) for the `/usr/local/bin/kumo` symlink. The install
    step triggers a macOS administrator authorization prompt via `osascript`
    because the default `/usr/local/bin` requires elevated privileges.
-3. **Agent Skill** — lists every `AgentSkillsTarget`, all unselected by
+4. **Agent Skill** — lists every `AgentSkillsTarget`, all unselected by
    default, and installs the bundled Kumo skill into each selected agent's
    `~/.<agent>/skills` directory through `AgentSkillsInstaller`.
-4. **Done** — summarises what was installed and saves
+5. **Done** — summarises what was installed and saves
    `hasCompletedOnboarding = true` through `KumoAppStore.completeOnboarding()`.
+
+If Start is invoked while the Helper is missing or requires repair,
+`KumoAppStore` opens this sheet and reports the exact install/repair action
+instead of allowing a local runtime fallback. Returning users jump directly to
+the Helper step when setup is reopened for that failure.
 
 Settings exposes `Run Setup Again` (`KumoAppStore.reopenOnboarding()`) so users
 can rerun the flow without resetting the persisted flag. The sheet is also the

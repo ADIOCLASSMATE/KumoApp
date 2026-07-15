@@ -46,6 +46,11 @@ kumo completion zsh
 kumo logs cli --limit 5
 ```
 
+`kumo profile refresh <url>` normalizes and imports the response as non-current,
+then runs the same transactional activation used by the App. It reports success
+only after a running core has switched and verified the new generation (or the
+selection has safely committed while strictly stopped).
+
 ## CLI Interaction Conventions
 
 Kumo follows the parts of npm's CLI interaction model that make command-line
@@ -184,23 +189,36 @@ identical to triggering the same flow from the GUI. They require the
 
 ## Shared Control Layer
 
-The CLI must not bypass `KumoCoreKit`. When `KumoService` is installed and
-reachable, the same commands switch to service-backed calls while keeping
-command names and JSON schemas compatible:
+The CLI must not bypass `KumoCoreKit`. Its production controller always requires
+the authenticated `KumoService` backend for lifecycle and live-runtime
+mutations; direct supervisor authority is limited to the Helper and isolated
+tests. A missing, partial, incompatible, or unreachable Helper makes mutation
+commands fail clearly instead of falling back and risking a second Mihomo
+process, while command names and JSON schemas remain stable:
 
 - `kumo start|stop|restart` delegates Mihomo lifecycle to the helper.
 - `kumo sysproxy on|off` delegates protected system proxy changes to the helper
   unless `--dry-run` is used.
 - `kumo tun enable|disable` delegates TUN state changes to the helper and fails
   clearly when no helper or privileged process can manage `utun`.
-- `kumo service install|uninstall|status` reports LaunchDaemon/socket state and
-  uses macOS administrator authorization for install and uninstall.
+- `kumo service install|uninstall|status` reports manifest, handshake,
+  LaunchDaemon, and socket health and
+  uses macOS administrator authorization for install and uninstall. A first
+  install, or reinstall of a reachable compatible Helper, requires a strictly
+  stopped runtime with System Proxy off. For an installed unreachable or
+  incompatible Helper, the same command safely restores local proxy state,
+  resets privileged recovery state, and, when a runtime was present or
+  ambiguous, force-activates the selected profile on the new Helper. A
+  previously enabled proxy is restored only after that activation succeeds.
 - `kumo substore status|prepare|start|stop|restart` manages bundled Sub-Store
   resources and the same local lifecycle used by the SwiftUI app.
+- `--core` is retained for isolated supervisor development/tests and is rejected
+  by the production CLI authority; the Helper executes only its protected
+  managed Mihomo binary.
 
-App Intents follow the same rule: when service mode lands, intents should
-hit service endpoints rather than `KumoAppStore` directly so they keep
-working when the GUI is closed.
+App Intents call the live `KumoAppStore`, which reaches the same controller and
+Helper ownership rules as the GUI while the App is running. The current design
+does not promise closed-GUI intent execution.
 
 ## Future Work
 

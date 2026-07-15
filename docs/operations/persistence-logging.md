@@ -8,7 +8,8 @@ Kumo stores local state under:
 ~/Library/Application Support/Kumo/
 ```
 
-`KumoPaths` centralizes all paths so GUI, CLI, tests, and future service code use the same layout.
+`KumoPaths` centralizes user-owned and privileged path derivation so the GUI,
+CLI, tests, and Helper agree on their respective layouts.
 
 ## Directory Layout
 
@@ -21,20 +22,74 @@ Kumo/
   overrides/
     overrides.json
     files/
+      <id>.yaml
+      <id>.js
   work/
-    config.yaml
+    core.pid
+    core-instance.json
+    core-lifecycle.lock
+    instances/
+      <launch-id>/config.yaml
   logs/
     core.log
+    runtime-events.jsonl
     substore.log
   cores/
     mihomo
   substore/
     status.json
-    backend/
-    frontend/
+    resources/
+    data/
+    temp/
   state.json
   preferences.json
 ```
+
+When Helper mode owns Mihomo, authoritative lifecycle records, the lock, and
+per-launch configs are root-private instead:
+
+```text
+/private/var/run/io.kumo/<uid>/
+  state.json
+  core.pid
+  core-instance.json
+  core-lifecycle.lock
+  config.yaml
+  work/
+  logs/
+  instances/<launch-id>/config.yaml
+```
+
+State that must survive a Helper restart or reboot is stored separately:
+
+```text
+/Library/Application Support/io.kumo.KumoService/
+  installation-manifest.json
+  users/<uid>/
+    mihomo
+    service-credentials.json
+    system-proxy-state.json
+```
+
+`installation-manifest.json` is the root-owned commit record for the privileged
+installation. It records transaction phase, authorized UID, Helper/protocol
+identity and capabilities, executable/plist SHA-256 values, and the credential
+key ID, but never the shared secret. Disk classification combines this record
+with descriptor-verified artifacts so a partial or interrupted replacement is
+reported as repairable rather than mistaken for a healthy installed service.
+The normal App inspects only the executable, plist, and manifest because the
+per-user credential directory is deliberately root-owned `0700`; authenticated
+handshake success proves the key relationship. Only the privileged installer
+and Helper perform full on-disk credential and manifest key-ID validation.
+
+`system-proxy-state.json` is a minimal root-owned recovery journal. Enable and
+reconfigure stage the requested state before `networksetup`; disable stages a
+`completeDisable` recovery action before its first mutation. The journal keeps
+the exact pre-Kumo snapshot and the last read-back snapshot Kumo actually
+applied. When `/private/var/run` is recreated after a crash or reboot,
+`CoreStateStore` merges the journal into fresh runtime status. Helper startup
+completes and verifies an interrupted disable instead of re-enabling Kumo. The
+file uses root-only `0600` permissions and no-follow, atomic replacement.
 
 ## Backup Format
 
@@ -61,16 +116,26 @@ CoreKit import/export contract.
 - controller endpoint
 - mixed proxy port
 - system proxy state (including PAC `mode` and `pacScript`)
+- the exact pre-Kumo system proxy snapshot used to restore web, secure-web,
+  SOCKS, bypass, and auto-proxy/PAC values on disable or shutdown
+- the exact Kumo-applied proxy snapshot used as the compare-before-write
+  ownership check, plus any pending `completeDisable` recovery action
 - controlled runtime settings, including TUN stack, routing, DNS, route
   exclusions, MTU, and ICMP forwarding preferences
+- active profile identifier, runtime generation UUID, and exact generated-config
+  SHA-256 digest
 - last status message
 
-This allows the CLI and GUI to share state without requiring a service in v1.
+This lets the CLI and GUI share local-mode state without a daemon.
 Runtime setting models must decode missing fields with defaults so app updates
 can add new TUN controls without invalidating an existing `state.json`.
-When the privileged helper writes this file, it uses descriptor-based secure
-staging and atomic replacement, then preserves ownership for the authorized
-desktop user without following user-controlled temporary paths.
+The desktop App owns the user-visible `state.json`. The privileged Helper keeps
+its authoritative live runtime state in the root-owned private tree instead;
+it uses descriptor-based secure staging and atomic replacement and never
+projects runtime files through a user-replaceable parent directory. The proxy
+recovery journal described above is the deliberate persistent exception: it
+contains only the state needed to restore or safely reconcile macOS proxy
+ownership after loss of the volatile runtime directory.
 
 ## User Preferences
 
@@ -140,13 +205,34 @@ Sub-Store terminates the backend process and closes the log handle.
 
 ## Runtime Configuration
 
-The generated Mihomo runtime configuration is written to:
+The generated Mihomo runtime configuration is unique to a launch:
 
 ```text
-work/config.yaml
+work/instances/<launch-id>/config.yaml
 ```
 
-Mihomo is launched with the work directory so it reads the generated config.
+Helper mode uses the root-private
+`/private/var/run/io.kumo/<uid>/instances/` equivalent.
+Mihomo still receives the normal Kumo work directory through `-d`, while the
+exact config is supplied through `-f`. Only a validated instance directory is
+removed after stop; legacy cleanup never deletes the whole `work/` tree.
+`CoreStatus.configurationDigest` and the per-instance record store SHA-256 over
+the bytes of that exact YAML. Controller readiness is not a complete activation
+proof until the active profile ID, generation UUID, and stored digest match the
+immutable `RuntimeSpec` submitted for the launch.
+
+Mihomo stores HTTP provider downloads below
+`work/providers/{proxy,rule}/<profile-hash>/<provider-hash>.yaml`. The same
+profile-ID and provider-key/URL hashing is generated for local and Helper
+runtimes, so their physical roots differ but their cache-isolation rule does
+not.
+
+Profile YAML, metadata, and selection files use user-only permissions. Reads
+reject traversal identifiers, symlinks, non-regular files, hard links, foreign
+owners in Helper mode, and oversized data. Core logs, runtime events, PID files,
+instance records, and instance configs are opened without following symlinks and
+are validated through their file descriptors before permissions or ownership
+are changed.
 
 ## Logs
 
@@ -199,7 +285,7 @@ public places without review.
 
 ## Overrides
 
-Overrides are planned under:
+Overrides are persisted under:
 
 ```text
 overrides/
@@ -207,15 +293,26 @@ overrides/
   files/
     <id>.yaml
     <id>.js
-    <id>.log
 ```
 
-YAML overrides are applied before Kumo-controlled runtime settings. JavaScript overrides require a reviewed sandbox before they are enabled.
+`overrides.json` stores ordering, enabled state, global/profile scope, format,
+source, and the owning `profileID` for non-global entries. Runtime generation
+loads the selected profile's enabled YAML entries first, then enabled global
+YAML entries, and finally appends Kumo-controlled settings. Legacy local
+metadata without a `profileID` remains readable for migration but is not applied
+to any profile. JavaScript content can be stored as `.js`, but execution remains
+disabled until a reviewed sandbox exists; there is no per-override `.log` file.
+
+Every override mutation snapshots the complete repository tree, including
+metadata and content files. Profile-scoped changes structurally preflight the
+selected profile, while global changes structurally preflight every stored
+profile because their merge affects every future runtime. If preflight or live
+activation fails, Kumo restores the snapshot atomically; a live failure also
+restores the previously verified runtime generation.
 
 ## Future Work
 
-- Rotate logs.
-- Add separate app and service logs.
-- Add structured JSONL event logs for agents.
+- Add separate app and service diagnostic log views.
 - Add privacy review for logs before sharing diagnostics.
-- Add log rotation and Sub-Store log retention controls.
+- Add explicit core, runtime-event, and Sub-Store log rotation/retention
+  controls.

@@ -54,7 +54,7 @@ extension KumoCommand {
             @OptionGroup var options: CLIOptions
             mutating func run() async throws {
                 try options.install()
-                let result = try CLIRuntime.current.controller.exportBackup(to: URL(fileURLWithPath: path))
+                let result = try await CLIRuntime.current.controller.exportBackup(to: URL(fileURLWithPath: path))
                 CLIRuntime.current.write(result) { "exported backup to \($0.destinationPath)" }
             }
         }
@@ -66,7 +66,7 @@ extension KumoCommand {
             @OptionGroup var options: CLIOptions
             mutating func run() async throws {
                 try options.install()
-                let manifest = try CLIRuntime.current.controller.importBackup(from: URL(fileURLWithPath: path))
+                let manifest = try await CLIRuntime.current.controller.importBackup(from: URL(fileURLWithPath: path))
                 CLIRuntime.current.write(manifest) { "imported backup from \($0.createdAt)" }
             }
         }
@@ -106,7 +106,12 @@ extension KumoCommand {
                     throw ValidationError("Invalid profile URL: \(url)")
                 }
                 let profile = try await CLIRuntime.current.controller.refreshProfile(from: parsedURL)
-                CLIRuntime.current.write(profile) { "refreshed \($0.name)" }
+                _ = try await CLIRuntime.current.controller.activateProfile(
+                    id: profile.id,
+                    policy: .preserveRunState
+                )
+                let activated = try CLIRuntime.current.controller.currentProfile()
+                CLIRuntime.current.write(activated) { "refreshed and activated \($0.name)" }
             }
         }
     }
@@ -150,7 +155,7 @@ extension KumoCommand {
             @OptionGroup var options: CLIOptions
             mutating func run() async throws {
                 try options.install()
-                write(try CLIRuntime.current.controller.installServiceMode())
+                write(try await CLIRuntime.current.controller.installServiceMode())
             }
         }
 
@@ -159,7 +164,7 @@ extension KumoCommand {
             @OptionGroup var options: CLIOptions
             mutating func run() async throws {
                 try options.install()
-                write(try CLIRuntime.current.controller.uninstallServiceMode())
+                write(try await CLIRuntime.current.controller.uninstallServiceMode())
             }
         }
 

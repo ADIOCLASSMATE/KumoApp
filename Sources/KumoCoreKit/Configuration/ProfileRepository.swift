@@ -1,14 +1,33 @@
+import Darwin
 import Foundation
+
+struct ProfileRepositorySnapshot: Sendable {
+    var profileID: String
+    var profileData: Data?
+    var metadataData: Data?
+}
 
 public struct ProfileRepository: Sendable {
     private let profilesDirectory: URL
     private let currentProfileFile: URL
     private let metadataFile: URL
+    private let contentNormalizer: ProfileContentNormalizer
 
     public init(paths: KumoPaths = KumoPaths()) {
+        self.init(
+            paths: paths,
+            subscriptionConverter: IsolatedSubStoreSubscriptionConverter()
+        )
+    }
+
+    init(
+        paths: KumoPaths,
+        subscriptionConverter: any ProfileSubscriptionConverting
+    ) {
         self.profilesDirectory = paths.profilesDirectory
         self.currentProfileFile = paths.profilesDirectory.appendingPathComponent("current.txt")
         self.metadataFile = paths.profilesDirectory.appendingPathComponent("profiles-metadata.json")
+        self.contentNormalizer = ProfileContentNormalizer(converter: subscriptionConverter)
     }
 
     public func loadDefaultProfile() throws -> Profile {
@@ -50,15 +69,27 @@ public struct ProfileRepository: Sendable {
             ?? ProfileSummary(id: "default", name: "Default", sourceDescription: "Generated direct profile", isCurrent: true)
     }
 
-    public func setCurrentProfile(id: String) throws {
+    func setCurrentProfile(id: String) throws {
+        try validateProfileID(id)
         try FileManager.default.createDirectory(
             at: profilesDirectory,
             withIntermediateDirectories: true
         )
-        try id.data(using: .utf8)?.write(to: currentProfileFile, options: .atomic)
+        guard id == "default" || FileManager.default.fileExists(atPath: profileURL(for: id).path) else {
+            throw KumoError.invalidArguments("The selected profile no longer exists.")
+        }
+        guard let data = id.data(using: .utf8) else {
+            throw KumoError.invalidArguments("The profile identifier could not be encoded as UTF-8.")
+        }
+        try writeOwnedData(data, to: currentProfileFile, permissions: 0o600)
+    }
+
+    public func currentProfileIDValue() throws -> String {
+        try currentProfileID()
     }
 
     public func loadProfile(id: String) throws -> Profile {
+        try validateProfileID(id)
         let profileURL = profileURL(for: id)
         guard FileManager.default.fileExists(atPath: profileURL.path) else {
             if id != "default" {
@@ -72,7 +103,7 @@ public struct ProfileRepository: Sendable {
             )
         }
 
-        let yaml = try String(contentsOf: profileURL, encoding: .utf8)
+        let yaml = try readUTF8(at: profileURL)
         let metadata = try loadMetadata()[id]
         let source: ProfileSource
         if metadata?.kind == .remote, let remoteURL = metadata?.remoteURL {
@@ -104,23 +135,26 @@ public struct ProfileRepository: Sendable {
     }
 
     public func saveDefaultProfile(_ profile: Profile) throws {
+        try ProfileContentNormalizer.validateMihomoYAML(profile.rawYAML)
         try FileManager.default.createDirectory(
             at: profilesDirectory,
             withIntermediateDirectories: true
         )
         let url = profilesDirectory.appendingPathComponent("default.yaml")
-        try profile.rawYAML.data(using: .utf8)?.write(to: url, options: .atomic)
+        try writeProfileYAML(profile.rawYAML, to: url)
     }
 
     @discardableResult
-    public func saveProfile(_ profile: Profile, preferredID: String? = nil, makeCurrent: Bool = true) throws -> ProfileSummary {
+    func saveProfile(_ profile: Profile, preferredID: String? = nil, makeCurrent: Bool = false) throws -> ProfileSummary {
+        try ProfileContentNormalizer.validateMihomoYAML(profile.rawYAML)
         try FileManager.default.createDirectory(
             at: profilesDirectory,
             withIntermediateDirectories: true
         )
         let id = preferredID ?? stableProfileID(for: profile)
+        try validateProfileID(id)
         let url = profileURL(for: id)
-        try profile.rawYAML.data(using: .utf8)?.write(to: url, options: .atomic)
+        try writeProfileYAML(profile.rawYAML, to: url)
         var metadata = try loadMetadata()
         let existing = metadata[id]
         metadata[id] = ProfileMetadata(
@@ -144,8 +178,9 @@ public struct ProfileRepository: Sendable {
         return try summary(for: id, url: url, metadata: metadata[id], currentID: makeCurrent ? id : currentProfileID())
     }
 
-    public func importLocalProfile(from url: URL, name: String? = nil) throws -> Profile {
-        let yaml = try String(contentsOf: url, encoding: .utf8)
+    public func importLocalProfile(from url: URL, name: String? = nil) async throws -> Profile {
+        let rawContent = try String(contentsOf: url, encoding: .utf8)
+        let yaml = try await contentNormalizer.normalize(rawContent)
         return Profile(
             name: name ?? url.deletingPathExtension().lastPathComponent,
             source: .file(url),
@@ -172,7 +207,7 @@ public struct ProfileRepository: Sendable {
         useProxy: Bool = false,
         proxyPort: Int? = nil,
         preferredID: String? = nil,
-        makeCurrent: Bool = true
+        makeCurrent: Bool = false
     ) async throws -> ProfileSummary {
         if useProxy, proxyPort == nil || proxyPort == 0 {
             throw KumoError.invalidArguments("Start Kumo before updating this profile through the local proxy.")
@@ -190,9 +225,10 @@ public struct ProfileRepository: Sendable {
             updatedAt: Date()
         )
         let id = preferredID ?? stableProfileID(for: profile)
+        try validateProfileID(id)
         let profileURL = profileURL(for: id)
         try FileManager.default.createDirectory(at: profilesDirectory, withIntermediateDirectories: true)
-        try document.yaml.data(using: .utf8)?.write(to: profileURL, options: .atomic)
+        try writeProfileYAML(document.yaml, to: profileURL)
 
         var metadata = try loadMetadata()
         metadata[id] = ProfileMetadata(
@@ -226,7 +262,7 @@ public struct ProfileRepository: Sendable {
         autoUpdate: Bool = true,
         useProxy: Bool = false,
         preferredID: String? = nil,
-        makeCurrent: Bool = true
+        makeCurrent: Bool = false
     ) async throws -> ProfileSummary {
         let document = try await fetchRemoteProfileDocument(from: downloadURL, name: name, proxyPort: nil)
         let profile = Profile(
@@ -236,9 +272,10 @@ public struct ProfileRepository: Sendable {
             updatedAt: Date()
         )
         let id = preferredID ?? stableProfileID(for: profile)
+        try validateProfileID(id)
         let profileURL = profileURL(for: id)
         try FileManager.default.createDirectory(at: profilesDirectory, withIntermediateDirectories: true)
-        try document.yaml.data(using: .utf8)?.write(to: profileURL, options: .atomic)
+        try writeProfileYAML(document.yaml, to: profileURL)
 
         var metadata = try loadMetadata()
         metadata[id] = ProfileMetadata(
@@ -266,6 +303,7 @@ public struct ProfileRepository: Sendable {
 
     @discardableResult
     public func refreshRemoteProfile(id: String, proxyPort: Int? = nil) async throws -> ProfileSummary {
+        try validateProfileID(id)
         let metadata = try loadMetadata()
         guard let item = metadata[id], item.kind == .remote, let remoteURL = item.remoteURL else {
             throw KumoError.invalidArguments("This profile does not have a remote subscription URL.")
@@ -284,29 +322,87 @@ public struct ProfileRepository: Sendable {
 
     @discardableResult
     public func refreshDueRemoteProfiles(now: Date = Date(), proxyPort: Int? = nil) async throws -> [ProfileSummary] {
-        let metadata = try loadMetadata()
         var refreshed: [ProfileSummary] = []
-
-        for item in metadata.values where item.kind == .remote && item.autoUpdate {
-            guard let interval = item.updateIntervalSeconds, interval > 0 else {
-                continue
-            }
-            let updatedAt = item.updatedAt ?? .distantPast
-            guard now.timeIntervalSince(updatedAt) >= TimeInterval(interval) else {
-                continue
-            }
-            refreshed.append(try await refreshRemoteProfile(id: item.id, proxyPort: proxyPort))
+        for id in try dueRemoteProfileIDs(now: now) {
+            refreshed.append(try await refreshRemoteProfile(id: id, proxyPort: proxyPort))
         }
 
         return refreshed
+    }
+
+    func dueRemoteProfileIDs(now: Date = Date()) throws -> [String] {
+        try loadMetadata().values.compactMap { item -> String? in
+            guard item.kind == .remote,
+                  item.autoUpdate,
+                  let interval = item.updateIntervalSeconds,
+                  interval > 0 else {
+                return nil
+            }
+            let updatedAt = item.updatedAt ?? .distantPast
+            return now.timeIntervalSince(updatedAt) >= TimeInterval(interval) ? item.id : nil
+        }
+        .sorted()
     }
 
     public func profileContent(id: String) throws -> String {
         try loadProfile(id: id).rawYAML
     }
 
+    func snapshot(profileID: String) throws -> ProfileRepositorySnapshot {
+        try validateProfileID(profileID)
+        return ProfileRepositorySnapshot(
+            profileID: profileID,
+            profileData: try optionalData(at: profileURL(for: profileID)),
+            metadataData: try optionalData(at: metadataFile)
+        )
+    }
+
+    func restore(_ snapshot: ProfileRepositorySnapshot) throws {
+        try validateProfileID(snapshot.profileID)
+        try FileManager.default.createDirectory(at: profilesDirectory, withIntermediateDirectories: true)
+        try restore(snapshot.profileData, at: profileURL(for: snapshot.profileID), permissions: 0o600)
+        var metadata = try loadMetadata()
+        let previousMetadata = try snapshot.metadataData.map(decodeMetadata)?[snapshot.profileID]
+        metadata[snapshot.profileID] = previousMetadata
+        try saveMetadata(metadata)
+    }
+
+    func fallbackProfileID(excluding profileID: String) throws -> String {
+        try validateProfileID(profileID)
+        return try nextProfileID(afterDeleting: profileID)
+    }
+
+    public func normalizedProfile(id: String) async throws -> Profile {
+        let (profile, wasChanged) = try await normalizedProfileForValidation(id: id)
+        guard wasChanged else {
+            return profile
+        }
+
+        try writeProfileYAML(profile.rawYAML, to: profileURL(for: id))
+        return profile
+    }
+
+    func normalizedProfileForValidation(id: String) async throws -> (Profile, Bool) {
+        let profile = try loadExistingProfile(id: id)
+        let normalizedYAML = try await contentNormalizer.normalize(profile.rawYAML)
+        guard normalizedYAML != profile.rawYAML else {
+            return (profile, false)
+        }
+
+        return (
+            Profile(
+                id: profile.id,
+                name: profile.name,
+                source: profile.source,
+                rawYAML: normalizedYAML,
+                updatedAt: profile.updatedAt
+            ),
+            true
+        )
+    }
+
     @discardableResult
-    public func updateProfile(
+    func updateProfile(
         id: String,
         name: String,
         remoteURL: URL?,
@@ -314,9 +410,11 @@ public struct ProfileRepository: Sendable {
         useProxy: Bool,
         rawYAML: String
     ) throws -> ProfileSummary {
+        try validateProfileID(id)
+        try ProfileContentNormalizer.validateMihomoYAML(rawYAML)
         try FileManager.default.createDirectory(at: profilesDirectory, withIntermediateDirectories: true)
         let url = profileURL(for: id)
-        try rawYAML.data(using: .utf8)?.write(to: url, options: .atomic)
+        try writeProfileYAML(rawYAML, to: url)
 
         var metadata = try loadMetadata()
         let existing = metadata[id]
@@ -340,13 +438,18 @@ public struct ProfileRepository: Sendable {
     }
 
     @discardableResult
-    public func deleteProfile(id: String) throws -> Bool {
+    func deleteProfile(id: String) throws -> Bool {
+        try validateProfileID(id)
         guard id != "default" else {
             throw KumoError.invalidArguments("The default profile cannot be deleted.")
         }
 
         let wasCurrent = try currentProfileID() == id
-        try? FileManager.default.removeItem(at: profileURL(for: id))
+        let url = profileURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw KumoError.invalidArguments("The selected profile no longer exists.")
+        }
+        try FileManager.default.removeItem(at: url)
         var metadata = try loadMetadata()
         metadata[id] = nil
         try saveMetadata(metadata)
@@ -377,7 +480,10 @@ public struct ProfileRepository: Sendable {
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         )
-        .filter { ["yaml", "yml"].contains($0.pathExtension.lowercased()) }
+        .filter {
+            ["yaml", "yml"].contains($0.pathExtension.lowercased())
+                && isSafeRegularFile(at: $0)
+        }
     }
 
     private func profileURL(for id: String) -> URL {
@@ -388,9 +494,11 @@ public struct ProfileRepository: Sendable {
         guard FileManager.default.fileExists(atPath: currentProfileFile.path) else {
             return "default"
         }
-        let value = try String(contentsOf: currentProfileFile, encoding: .utf8)
+        let value = try readUTF8(at: currentProfileFile)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? "default" : value
+        let id = value.isEmpty ? "default" : value
+        try validateProfileID(id)
+        return id
     }
 
     private func displayName(for url: URL) -> String {
@@ -492,7 +600,10 @@ public struct ProfileRepository: Sendable {
         guard FileManager.default.fileExists(atPath: metadataFile.path) else {
             return [:]
         }
-        let data = try Data(contentsOf: metadataFile)
+        return try decodeMetadata(readRegularFileData(at: metadataFile))
+    }
+
+    private func decodeMetadata(_ data: Data) throws -> [String: ProfileMetadata] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([String: ProfileMetadata].self, from: data)
@@ -504,19 +615,26 @@ public struct ProfileRepository: Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(metadata)
-        try data.write(to: metadataFile, options: .atomic)
+        try writeOwnedData(data, to: metadataFile, permissions: 0o600)
     }
 
     private func fetchRemoteProfileDocument(from url: URL, name: String?, proxyPort: Int?) async throws -> RemoteProfileDocument {
         let session = URLSession(configuration: urlSessionConfiguration(proxyPort: proxyPort))
-        let (data, response) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("Clash.Meta", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/yaml, text/yaml, text/plain, */*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
         if let httpResponse = response as? HTTPURLResponse,
            !(200..<300).contains(httpResponse.statusCode) {
             throw KumoError.controllerResponse(httpResponse.statusCode, String(decoding: data, as: UTF8.self))
         }
 
         let headers = (response as? HTTPURLResponse)?.allHeaderFields ?? [:]
-        let yaml = String(decoding: data, as: UTF8.self)
+        guard let rawContent = String(data: data, encoding: .utf8) else {
+            throw KumoError.invalidArguments("The profile response is not valid UTF-8 text.")
+        }
+        let yaml = try await contentNormalizer.normalize(rawContent)
         return RemoteProfileDocument(
             name: name ?? filename(from: headers) ?? url.host ?? "Remote Profile",
             yaml: yaml,
@@ -588,11 +706,116 @@ public struct ProfileRepository: Sendable {
     }
 
     private func nextProfileID(afterDeleting deletedID: String) throws -> String {
+        try validateProfileID(deletedID)
         let remaining = try profileFileURLs()
             .map { $0.deletingPathExtension().lastPathComponent }
             .filter { $0 != deletedID }
             .sorted()
         return remaining.first ?? "default"
+    }
+
+    private func loadExistingProfile(id: String) throws -> Profile {
+        try validateProfileID(id)
+        if id == "default", !FileManager.default.fileExists(atPath: profileURL(for: id).path) {
+            return Profile(
+                name: "Empty Profile",
+                source: .inline,
+                rawYAML: defaultProfileYAML(),
+                updatedAt: Date()
+            )
+        }
+        guard FileManager.default.fileExists(atPath: profileURL(for: id).path) else {
+            throw KumoError.invalidArguments("The selected profile no longer exists.")
+        }
+        return try loadProfile(id: id)
+    }
+
+    private func writeProfileYAML(_ yaml: String, to url: URL) throws {
+        guard let data = yaml.data(using: .utf8) else {
+            throw KumoError.invalidArguments("The profile could not be encoded as UTF-8.")
+        }
+        try writeOwnedData(data, to: url, permissions: 0o600)
+    }
+
+    private func optionalData(at url: URL) throws -> Data? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try readRegularFileData(at: url)
+    }
+
+    private func validateProfileID(_ id: String) throws {
+        guard !id.isEmpty,
+              id != ".",
+              id != "..",
+              id.utf8.count <= 255,
+              !id.contains("/"),
+              !id.contains("\\"),
+              id.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            throw KumoError.invalidArguments("The profile identifier is invalid.")
+        }
+    }
+
+    private func isSafeRegularFile(at url: URL) -> Bool {
+        var fileStatus = stat()
+        guard lstat(url.path, &fileStatus) == 0,
+              fileStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              fileStatus.st_nlink == 1 else {
+            return false
+        }
+        return true
+    }
+
+    private func readUTF8(at url: URL) throws -> String {
+        let data = try readRegularFileData(at: url)
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw KumoError.invalidArguments("The profile file is not valid UTF-8 text.")
+        }
+        return value
+    }
+
+    private func readRegularFileData(at url: URL) throws -> Data {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw KumoError.serviceUnavailable("Kumo could not open a profile file safely.")
+        }
+        defer { close(descriptor) }
+        var fileStatus = stat()
+        guard fstat(descriptor, &fileStatus) == 0,
+              fileStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              fileStatus.st_nlink == 1,
+              fileStatus.st_size >= 0,
+              fileStatus.st_size <= 32 * 1024 * 1024 else {
+            throw KumoError.serviceUnavailable("Kumo refused an unsafe profile file.")
+        }
+        return try FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: false
+        ).readToEnd() ?? Data()
+    }
+
+    private func restore(_ data: Data?, at url: URL, permissions: Int) throws {
+        guard let data else {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            return
+        }
+        try writeOwnedData(data, to: url, permissions: permissions)
+    }
+
+    private func writeOwnedData(_ data: Data, to url: URL, permissions: Int) throws {
+        try data.write(to: url, options: .atomic)
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw KumoError.serviceUnavailable("Kumo could not open a profile file safely.")
+        }
+        defer { close(descriptor) }
+        var fileStatus = stat()
+        guard fstat(descriptor, &fileStatus) == 0,
+              fileStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              fileStatus.st_nlink == 1,
+              fchmod(descriptor, mode_t(permissions)) == 0 else {
+            throw KumoError.serviceUnavailable("Kumo refused an unsafe profile file.")
+        }
     }
 }
 

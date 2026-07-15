@@ -1,6 +1,7 @@
 # Core Documentation
 
-Core docs describe the shared `KumoCoreKit` behavior used by the GUI, CLI, and future service mode.
+Core docs describe the shared `KumoCoreKit` behavior used by the GUI, CLI, and
+privileged Helper backend.
 
 ## Documents
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Yams
 
@@ -5,12 +6,22 @@ public struct RuntimeConfig: Equatable, Sendable {
     public var yaml: String
     public var endpoint: ControllerEndpoint
     public var proxyPorts: ProxyPortConfiguration
+    public var configurationDigest: String
 }
 
 public struct RuntimeConfigBuilder: Sendable {
     private static let controlledTopLevelKeys: Set<String> = [
         "external-controller",
+        "external-controller-cors",
+        "external-controller-pipe",
+        "external-controller-tls",
+        "external-controller-unix",
+        "external-doh-server",
+        "external-ui",
+        "external-ui-name",
+        "external-ui-url",
         "secret",
+        "tls",
         "port",
         "socks-port",
         "redir-port",
@@ -31,12 +42,14 @@ public struct RuntimeConfigBuilder: Sendable {
     public var proxyPorts: ProxyPortConfiguration
     public var mode: OutboundMode
     public var runtimeSettings: CoreRuntimeSettings
+    public var enforceManagedFeatureSettings: Bool
 
     public init(
         endpoint: ControllerEndpoint = ControllerEndpoint(),
         proxyPorts: ProxyPortConfiguration = ProxyPortConfiguration(),
         mode: OutboundMode = .rule,
-        runtimeSettings: CoreRuntimeSettings = CoreRuntimeSettings()
+        runtimeSettings: CoreRuntimeSettings = CoreRuntimeSettings(),
+        enforceManagedFeatureSettings: Bool = false
     ) {
         var effectiveRuntimeSettings = runtimeSettings
         if effectiveRuntimeSettings.mixedPort == CoreRuntimeSettings().mixedPort {
@@ -46,16 +59,41 @@ public struct RuntimeConfigBuilder: Sendable {
         self.proxyPorts = ProxyPortConfiguration(mixedPort: effectiveRuntimeSettings.mixedPort)
         self.mode = mode
         self.runtimeSettings = effectiveRuntimeSettings
+        self.enforceManagedFeatureSettings = enforceManagedFeatureSettings
     }
 
-    public func build(profile: Profile, overrideYAMLs: [String] = []) throws -> RuntimeConfig {
-        let yaml = try mergedRuntimeYAML(profileYAML: profile.rawYAML, overrideYAMLs: overrideYAMLs)
+    public func build(
+        profile: Profile,
+        profileID: String? = nil,
+        overrideYAMLs: [String] = []
+    ) throws -> RuntimeConfig {
+        let yaml = try mergedRuntimeYAML(
+            profileYAML: profile.rawYAML,
+            profileID: profileID ?? profile.id.uuidString.lowercased(),
+            overrideYAMLs: overrideYAMLs
+        )
 
-        return RuntimeConfig(yaml: yaml, endpoint: endpoint, proxyPorts: proxyPorts)
+        return RuntimeConfig(
+            yaml: yaml,
+            endpoint: endpoint,
+            proxyPorts: proxyPorts,
+            configurationDigest: SHA256.hash(data: Data(yaml.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        )
     }
 
-    public func write(profile: Profile, overrideYAMLs: [String] = [], to url: URL) throws -> RuntimeConfig {
-        let config = try build(profile: profile, overrideYAMLs: overrideYAMLs)
+    public func write(
+        profile: Profile,
+        profileID: String? = nil,
+        overrideYAMLs: [String] = [],
+        to url: URL
+    ) throws -> RuntimeConfig {
+        let config = try build(
+            profile: profile,
+            profileID: profileID,
+            overrideYAMLs: overrideYAMLs
+        )
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -64,72 +102,134 @@ public struct RuntimeConfigBuilder: Sendable {
         return config
     }
 
-    private func mergedRuntimeYAML(profileYAML: String, overrideYAMLs: [String]) throws -> String {
+    private func mergedRuntimeYAML(
+        profileYAML: String,
+        profileID: String,
+        overrideYAMLs: [String]
+    ) throws -> String {
         var document = try StructuredYAMLDocument(rawYAML: profileYAML)
 
         for overrideYAML in overrideYAMLs {
             try document.merge(StructuredYAMLDocument(rawYAML: overrideYAML))
         }
 
-        document.removeTopLevelKeys(controlledTopLevelKeys())
+        if enforceManagedFeatureSettings {
+            try document.restrictForPrivilegedRuntime(profileID: profileID)
+        } else {
+            try document.namespaceRemoteProviderStorage(profileID: profileID)
+        }
 
-        return [
-            try document.renderedYAML(),
-            controlledConfigYAML()
-        ]
-        .filter { !$0.isEmpty }
-        .joined(separator: "\n\n")
+        document.removeTopLevelKeys(controlledTopLevelKeys())
+        document.replaceTopLevelValues(try controlledConfigMapping())
+        return try document.renderedYAML()
     }
 
-    private func controlledConfigYAML() -> String {
-        let base = """
-        # Kumo controlled runtime settings
-        external-controller: \(endpoint.host):\(endpoint.port)
-        secret: "\(escaped(endpoint.secret))"
-        mixed-port: \(runtimeSettings.mixedPort)
-        mode: \(mode.rawValue)
-        allow-lan: \(runtimeSettings.allowLAN ? "true" : "false")
-        log-level: \(runtimeSettings.logLevel)
-        ipv6: \(runtimeSettings.ipv6 ? "true" : "false")
-        find-process-mode: \(runtimeSettings.findProcessMode)
-        geodata-mode: \(runtimeSettings.geoData.usesDatMode ? "true" : "false")
-        geo-auto-update: \(runtimeSettings.geoData.autoUpdate ? "true" : "false")
-        geo-update-interval: \(runtimeSettings.geoData.updateIntervalHours)
-        geox-url:
-          geoip: "\(escaped(runtimeSettings.geoData.geoIPURL))"
-          geosite: "\(escaped(runtimeSettings.geoData.geoSiteURL))"
-          mmdb: "\(escaped(runtimeSettings.geoData.mmdbURL))"
-          asn: "\(escaped(runtimeSettings.geoData.asnURL))"
-        """
+    private func controlledConfigMapping() throws -> [String: Any] {
+        let controllerAddress = try validatedControllerAddress()
+        let minimumPort = enforceManagedFeatureSettings ? 1_024 : 1
+        guard (minimumPort...65_535).contains(runtimeSettings.mixedPort) else {
+            throw KumoError.invalidArguments("The mixed proxy port is outside Kumo's allowed range.")
+        }
+        guard endpoint.secret.utf8.count <= 4_096,
+              !endpoint.secret.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw KumoError.invalidArguments("The controller secret is invalid.")
+        }
+        let logLevel = try validatedEnum(
+            runtimeSettings.logLevel,
+            allowed: ["silent", "error", "warning", "info", "debug"],
+            name: "log level"
+        )
+        let findProcessMode = try validatedEnum(
+            runtimeSettings.findProcessMode,
+            allowed: ["always", "strict", "off"],
+            name: "process lookup mode"
+        )
+        guard (1...8_760).contains(runtimeSettings.geoData.updateIntervalHours) else {
+            throw KumoError.invalidArguments("The geodata update interval is outside Kumo's allowed range.")
+        }
 
-        var blocks: [String] = [base]
+        var mapping: [String: Any] = [
+            "external-controller": controllerAddress,
+            "secret": endpoint.secret,
+            "mixed-port": runtimeSettings.mixedPort,
+            "mode": mode.rawValue,
+            "allow-lan": runtimeSettings.allowLAN,
+            "log-level": logLevel,
+            "ipv6": runtimeSettings.ipv6,
+            "find-process-mode": findProcessMode,
+            "geodata-mode": runtimeSettings.geoData.usesDatMode,
+            "geo-auto-update": runtimeSettings.geoData.autoUpdate,
+            "geo-update-interval": runtimeSettings.geoData.updateIntervalHours,
+            "geox-url": [
+                "geoip": try validatedRemoteURL(runtimeSettings.geoData.geoIPURL, name: "GeoIP URL"),
+                "geosite": try validatedRemoteURL(runtimeSettings.geoData.geoSiteURL, name: "GeoSite URL"),
+                "mmdb": try validatedRemoteURL(runtimeSettings.geoData.mmdbURL, name: "MMDB URL"),
+                "asn": try validatedRemoteURL(runtimeSettings.geoData.asnURL, name: "ASN URL")
+            ]
+        ]
 
         if let tun = runtimeSettings.tun, tun.isEnabled {
-            blocks.append(controlledTunYAML(tun))
+            mapping["tun"] = try controlledTunMapping(tun)
         }
 
         if let dns = runtimeSettings.dns, dns.isEnabled {
-            blocks.append(controlledDnsYAML(dns))
+            mapping["dns"] = try controlledDnsMapping(dns)
         }
 
         if let sniffer = runtimeSettings.sniffer, sniffer.isEnabled {
-            blocks.append(controlledSnifferYAML(sniffer))
+            mapping["sniffer"] = controlledSnifferMapping(sniffer)
         }
 
         if let dns = runtimeSettings.dns, !dns.hosts.isEmpty {
-            blocks.append(controlledHostsYAML(dns.hosts))
+            mapping["hosts"] = policyMapping(dns.hosts)
         }
 
-        return blocks.joined(separator: "\n\n")
+        return mapping
     }
 
-    private func escaped(_ value: String) -> String {
-        value.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+    private func validatedControllerAddress() throws -> String {
+        let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let renderedHost: String
+        switch host {
+        case "127.0.0.1", "localhost":
+            renderedHost = host
+        case "::1", "[::1]":
+            renderedHost = "[::1]"
+        default:
+            throw KumoError.invalidArguments("The Mihomo controller must listen on the local machine.")
+        }
+        let minimumPort = enforceManagedFeatureSettings ? 1_024 : 1
+        guard (minimumPort...65_535).contains(endpoint.port) else {
+            throw KumoError.invalidArguments("The Mihomo controller port is outside Kumo's allowed range.")
+        }
+        return "\(renderedHost):\(endpoint.port)"
+    }
+
+    private func validatedEnum(_ value: String, allowed: Set<String>, name: String) throws -> String {
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard allowed.contains(value) else {
+            throw KumoError.invalidArguments("The \(name) is not supported by Kumo.")
+        }
+        return value
+    }
+
+    private func validatedRemoteURL(_ value: String, name: String) throws -> String {
+        guard value.utf8.count <= 4_096,
+              let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host != nil else {
+            throw KumoError.invalidArguments("The \(name) must be an HTTP or HTTPS URL.")
+        }
+        return value
     }
 
     private func controlledTopLevelKeys() -> Set<String> {
         var keys = Self.controlledTopLevelKeys
+        if enforceManagedFeatureSettings {
+            keys.formUnion(["tun", "dns", "listeners", "sniffer", "hosts"])
+            return keys
+        }
         if runtimeSettings.tun?.isEnabled == true {
             keys.insert("tun")
         }
@@ -145,200 +245,184 @@ public struct RuntimeConfigBuilder: Sendable {
         return keys
     }
 
-    private func controlledTunYAML(_ tun: TunSettings) -> String {
-        var lines = [
-            "# Kumo controlled TUN settings",
-            "tun:",
-            "  enable: true",
-            "  stack: \(tun.stack)",
-            "  auto-route: \(tun.autoRoute ? "true" : "false")",
-            "  auto-redirect: \(tun.autoRedirect ? "true" : "false")",
-            "  auto-detect-interface: \(tun.autoDetectInterface ? "true" : "false")",
-            "  strict-route: \(tun.strictRoute ? "true" : "false")",
-            "  disable-icmp-forwarding: \(tun.disableICMPForwarding ? "true" : "false")",
-            "  dns-hijack:",
+    private func controlledTunMapping(_ tun: TunSettings) throws -> [String: Any] {
+        let stack = try validatedEnum(
+            tun.stack,
+            allowed: ["mixed", "gvisor", "system"],
+            name: "TUN stack"
+        )
+        guard (576...9_000).contains(tun.mtu) else {
+            throw KumoError.invalidArguments("The TUN MTU is outside Kumo's allowed range.")
+        }
+        var mapping: [String: Any] = [
+            "enable": true,
+            "stack": stack,
+            "auto-route": tun.autoRoute,
+            "auto-redirect": tun.autoRedirect,
+            "auto-detect-interface": tun.autoDetectInterface,
+            "strict-route": tun.strictRoute,
+            "disable-icmp-forwarding": tun.disableICMPForwarding,
+            "dns-hijack": tun.dnsHijack,
+            "mtu": tun.mtu
         ]
-        lines.append(contentsOf: yamlList(tun.dnsHijack, indent: "    "))
         if !tun.routeExcludeAddress.isEmpty {
-            lines.append("  route-exclude-address:")
-            lines.append(contentsOf: yamlList(tun.routeExcludeAddress, indent: "    "))
+            mapping["route-exclude-address"] = tun.routeExcludeAddress
         }
-        lines.append("  mtu: \(tun.mtu)")
         if let device = normalizedTunDevice(tun.device) {
-            lines.append("  device: \(device)")
+            mapping["device"] = device
         }
-        return lines.joined(separator: "\n")
+        return mapping
     }
 
-    private func controlledDnsYAML(_ dns: DnsSettings) -> String {
-        var lines = [
-            "# Kumo controlled DNS settings",
-            "dns:",
-            "  enable: \(dns.isEnabled ? "true" : "false")",
-            "  ipv6: \(dns.ipv6 ? "true" : "false")",
-            "  enhanced-mode: \(dns.enhancedMode)",
-            "  fake-ip-range: \(dns.fakeIPRange)",
+    private func controlledDnsMapping(_ dns: DnsSettings) throws -> [String: Any] {
+        let enhancedMode = try validatedEnum(
+            dns.enhancedMode,
+            allowed: ["fake-ip", "redir-host", "normal"],
+            name: "DNS enhanced mode"
+        )
+        var mapping: [String: Any] = [
+            "enable": dns.isEnabled,
+            "ipv6": dns.ipv6,
+            "enhanced-mode": enhancedMode,
+            "fake-ip-range": dns.fakeIPRange,
+            "ipv6-timeout": max(0, dns.ipv6Timeout),
+            "prefer-h3": dns.preferH3,
+            "use-hosts": dns.useHosts,
+            "use-system-hosts": dns.useSystemHosts,
+            "respect-rules": dns.respectRules,
+            "direct-nameserver-follow-policy": dns.directNameserverFollowPolicy
         ]
         if !dns.listen.isEmpty {
-            lines.append("  listen: \(escapedScalar(dns.listen))")
+            mapping["listen"] = try validatedDNSListenAddress(dns.listen)
         }
-        lines.append("  ipv6-timeout: \(dns.ipv6Timeout)")
-        lines.append("  prefer-h3: \(dns.preferH3 ? "true" : "false")")
         if !dns.fakeIPRange6.isEmpty {
-            lines.append("  fake-ip-range6: \(dns.fakeIPRange6)")
+            mapping["fake-ip-range6"] = dns.fakeIPRange6
         }
         if !dns.fakeIPFilter.isEmpty {
-            lines.append("  fake-ip-filter:")
-            lines.append(contentsOf: yamlList(dns.fakeIPFilter, indent: "    "))
+            mapping["fake-ip-filter"] = dns.fakeIPFilter
         }
         if !dns.fakeIPFilterMode.isEmpty {
-            lines.append("  fake-ip-filter-mode: \(dns.fakeIPFilterMode)")
+            mapping["fake-ip-filter-mode"] = try validatedEnum(
+                dns.fakeIPFilterMode,
+                allowed: ["blacklist", "whitelist"],
+                name: "fake IP filter mode"
+            )
         }
-        lines.append("  use-hosts: \(dns.useHosts ? "true" : "false")")
-        lines.append("  use-system-hosts: \(dns.useSystemHosts ? "true" : "false")")
-        lines.append("  respect-rules: \(dns.respectRules ? "true" : "false")")
         if !dns.defaultNameserver.isEmpty {
-            lines.append("  default-nameserver:")
-            lines.append(contentsOf: yamlList(dns.defaultNameserver, indent: "    "))
+            mapping["default-nameserver"] = dns.defaultNameserver
         }
         if !dns.nameserver.isEmpty {
-            lines.append("  nameserver:")
-            lines.append(contentsOf: yamlList(dns.nameserver, indent: "    "))
+            mapping["nameserver"] = dns.nameserver
         }
         if !dns.fallback.isEmpty {
-            lines.append("  fallback:")
-            lines.append(contentsOf: yamlList(dns.fallback, indent: "    "))
+            mapping["fallback"] = dns.fallback
         }
         if !dns.fallbackFilter.isEmpty {
-            lines.append("  fallback-filter:")
-            lines.append(contentsOf: yamlFallbackFilterDict(dns.fallbackFilter, indent: "    "))
+            mapping["fallback-filter"] = fallbackFilterMapping(dns.fallbackFilter)
         }
         if !dns.proxyServerNameserver.isEmpty {
-            lines.append("  proxy-server-nameserver:")
-            lines.append(contentsOf: yamlList(dns.proxyServerNameserver, indent: "    "))
+            mapping["proxy-server-nameserver"] = dns.proxyServerNameserver
         }
         if !dns.directNameserver.isEmpty {
-            lines.append("  direct-nameserver:")
-            lines.append(contentsOf: yamlList(dns.directNameserver, indent: "    "))
+            mapping["direct-nameserver"] = dns.directNameserver
         }
-        lines.append("  direct-nameserver-follow-policy: \(dns.directNameserverFollowPolicy ? "true" : "false")")
         if !dns.nameserverPolicy.isEmpty {
-            lines.append("  nameserver-policy:")
-            lines.append(contentsOf: yamlPolicyDict(dns.nameserverPolicy, indent: "    "))
+            mapping["nameserver-policy"] = policyMapping(dns.nameserverPolicy)
         }
         if !dns.proxyServerNameserverPolicy.isEmpty {
-            lines.append("  proxy-server-nameserver-policy:")
-            lines.append(contentsOf: yamlPolicyDict(dns.proxyServerNameserverPolicy, indent: "    "))
+            mapping["proxy-server-nameserver-policy"] = policyMapping(dns.proxyServerNameserverPolicy)
         }
         if !dns.cacheAlgorithm.isEmpty {
-            lines.append("  cache-algorithm: \(dns.cacheAlgorithm)")
+            mapping["cache-algorithm"] = try validatedEnum(
+                dns.cacheAlgorithm,
+                allowed: ["lru", "arc"],
+                name: "DNS cache algorithm"
+            )
         }
-        return lines.joined(separator: "\n")
+        return mapping
     }
 
-    private func controlledHostsYAML(_ hosts: [String: PolicyValue]) -> String {
-        var lines = [
-            "# Kumo controlled hosts",
-            "hosts:"
-        ]
-        lines.append(contentsOf: yamlPolicyDict(hosts, indent: "  "))
-        return lines.joined(separator: "\n")
+    private func validatedDNSListenAddress(_ value: String) throws -> String {
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard enforceManagedFeatureSettings else { return value }
+        let host: String
+        let portText: Substring
+        if value.hasPrefix("[::1]:") {
+            host = "[::1]"
+            portText = value.dropFirst("[::1]:".count)
+        } else if let separator = value.lastIndex(of: ":") {
+            host = String(value[..<separator]).lowercased()
+            portText = value[value.index(after: separator)...]
+        } else {
+            throw KumoError.invalidArguments("The privileged DNS listener must be loopback-only.")
+        }
+        guard ["127.0.0.1", "localhost", "[::1]"].contains(host),
+              let port = Int(portText),
+              (1_024...65_535).contains(port) else {
+            throw KumoError.invalidArguments("The privileged DNS listener must use a loopback high port.")
+        }
+        return value
     }
 
-    private func controlledSnifferYAML(_ sniffer: SnifferSettings) -> String {
-        var lines = [
-            "# Kumo controlled Sniffer settings",
-            "sniffer:",
-            "  enable: \(sniffer.isEnabled ? "true" : "false")",
-            "  parse-pure-ip: \(sniffer.parsePureIP ? "true" : "false")",
-            "  force-dns-mapping: \(sniffer.forceDNSMapping ? "true" : "false")",
-            "  override-destination: \(sniffer.overrideDestination ? "true" : "false")",
+    private func controlledSnifferMapping(_ sniffer: SnifferSettings) -> [String: Any] {
+        var mapping: [String: Any] = [
+            "enable": sniffer.isEnabled,
+            "parse-pure-ip": sniffer.parsePureIP,
+            "force-dns-mapping": sniffer.forceDNSMapping,
+            "override-destination": sniffer.overrideDestination
         ]
         if !sniffer.httpPorts.isEmpty || !sniffer.tlsPorts.isEmpty || !sniffer.quicPorts.isEmpty || sniffer.httpOverrideDestination {
-            lines.append("  sniff:")
+            var sniff: [String: Any] = [:]
             if !sniffer.httpPorts.isEmpty || sniffer.httpOverrideDestination {
-                lines.append("    HTTP:")
+                var http: [String: Any] = [:]
                 if !sniffer.httpPorts.isEmpty {
-                    lines.append("      ports:")
-                    lines.append(contentsOf: sniffer.httpPorts.map { "        - \($0)" })
+                    http["ports"] = sniffer.httpPorts.filter { (1...65_535).contains($0) }
                 }
                 if sniffer.httpOverrideDestination {
-                    lines.append("      override-destination: true")
+                    http["override-destination"] = true
                 }
+                sniff["HTTP"] = http
             }
             if !sniffer.tlsPorts.isEmpty {
-                lines.append("    TLS:")
-                lines.append("      ports:")
-                lines.append(contentsOf: sniffer.tlsPorts.map { "        - \($0)" })
+                sniff["TLS"] = ["ports": sniffer.tlsPorts.filter { (1...65_535).contains($0) }]
             }
             if !sniffer.quicPorts.isEmpty {
-                lines.append("    QUIC:")
-                lines.append("      ports:")
-                lines.append(contentsOf: sniffer.quicPorts.map { "        - \($0)" })
+                sniff["QUIC"] = ["ports": sniffer.quicPorts.filter { (1...65_535).contains($0) }]
             }
+            mapping["sniff"] = sniff
         }
         if !sniffer.skipDomain.isEmpty {
-            lines.append("  skip-domain:")
-            lines.append(contentsOf: yamlList(sniffer.skipDomain, indent: "    "))
+            mapping["skip-domain"] = sniffer.skipDomain
         }
         if !sniffer.forceDomain.isEmpty {
-            lines.append("  force-domain:")
-            lines.append(contentsOf: yamlList(sniffer.forceDomain, indent: "    "))
+            mapping["force-domain"] = sniffer.forceDomain
         }
         if !sniffer.skipDstAddress.isEmpty {
-            lines.append("  skip-dst-address:")
-            lines.append(contentsOf: yamlList(sniffer.skipDstAddress, indent: "    "))
+            mapping["skip-dst-address"] = sniffer.skipDstAddress
         }
         if !sniffer.skipSrcAddress.isEmpty {
-            lines.append("  skip-src-address:")
-            lines.append(contentsOf: yamlList(sniffer.skipSrcAddress, indent: "    "))
+            mapping["skip-src-address"] = sniffer.skipSrcAddress
         }
-        return lines.joined(separator: "\n")
+        return mapping
     }
 
-    private func yamlList(_ values: [String], indent: String) -> [String] {
-        values.map { "\(indent)- \(escapedScalar($0))" }
-    }
-
-    private func yamlPolicyDict(_ dict: [String: PolicyValue], indent: String) -> [String] {
-        dict.sorted(by: { $0.key < $1.key }).flatMap { key, value -> [String] in
+    private func policyMapping(_ values: [String: PolicyValue]) -> [String: Any] {
+        values.mapValues { value in
             switch value {
-            case .single(let s):
-                return ["\(indent)\(key): \(quotedScalar(s))"]
-            case .multiple(let arr):
-                if arr.isEmpty {
-                    return ["\(indent)\(key): []"]
-                }
-                return ["\(indent)\(key):"] + arr.map { "\(indent)  - \(quotedScalar($0))" }
+            case .single(let value): value
+            case .multiple(let values): values
             }
         }
     }
 
-    private func yamlFallbackFilterDict(_ dict: [String: FallbackFilterValue], indent: String) -> [String] {
-        dict.sorted(by: { $0.key < $1.key }).flatMap { key, value -> [String] in
+    private func fallbackFilterMapping(_ values: [String: FallbackFilterValue]) -> [String: Any] {
+        values.mapValues { value in
             switch value {
-            case .bool(let b):
-                return ["\(indent)\(key): \(b ? "true" : "false")"]
-            case .single(let s):
-                return ["\(indent)\(key): \(quotedScalar(s))"]
-            case .multiple(let arr):
-                if arr.isEmpty {
-                    return ["\(indent)\(key): []"]
-                }
-                return ["\(indent)\(key):"] + arr.map { "\(indent)  - \(quotedScalar($0))" }
+            case .bool(let value): value
+            case .single(let value): value
+            case .multiple(let values): values
             }
         }
-    }
-
-    private func quotedScalar(_ value: String) -> String {
-        "\"\(escaped(value))\""
-    }
-
-    private func escapedScalar(_ value: String) -> String {
-        guard value.rangeOfCharacter(from: CharacterSet(charactersIn: ":#{}[]&,*?|-<>=!%@`\"'")) != nil else {
-            return value
-        }
-        return "\"\(escaped(value))\""
     }
 
     private func normalizedTunDevice(_ value: String?) -> String? {
@@ -354,6 +438,15 @@ public struct RuntimeConfigBuilder: Sendable {
 }
 
 private struct StructuredYAMLDocument {
+    private static let privilegedAllowedTopLevelKeys: Set<String> = [
+        "proxies",
+        "proxy-groups",
+        "proxy-providers",
+        "rules",
+        "rule-providers",
+        "sub-rules"
+    ]
+
     private var mapping: [String: Any]
 
     init(rawYAML: String) throws {
@@ -368,7 +461,10 @@ private struct StructuredYAMLDocument {
             return
         }
 
-        self.mapping = loaded as? [String: Any] ?? [:]
+        guard let mapping = loaded as? [String: Any] else {
+            throw KumoError.invalidArguments("The profile YAML root must be a mapping.")
+        }
+        self.mapping = mapping
     }
 
     mutating func merge(_ override: StructuredYAMLDocument) {
@@ -378,6 +474,175 @@ private struct StructuredYAMLDocument {
     mutating func removeTopLevelKeys(_ keys: Set<String>) {
         for key in keys {
             mapping.removeValue(forKey: key)
+        }
+    }
+
+    mutating func replaceTopLevelValues(_ values: [String: Any]) {
+        for (key, value) in values {
+            mapping[key] = value
+        }
+    }
+
+    mutating func namespaceRemoteProviderStorage(profileID: String) throws {
+        try rewriteHTTPProviderStorage(
+            key: "proxy-providers",
+            storageDirectory: "proxy",
+            profileID: profileID
+        )
+        try rewriteHTTPProviderStorage(
+            key: "rule-providers",
+            storageDirectory: "rule",
+            profileID: profileID
+        )
+    }
+
+    mutating func restrictForPrivilegedRuntime(profileID: String) throws {
+        mapping = mapping.filter { Self.privilegedAllowedTopLevelKeys.contains($0.key) }
+        try sanitizeProviders(
+            key: "proxy-providers",
+            storageDirectory: "proxy",
+            profileID: profileID
+        )
+        try sanitizeProviders(
+            key: "rule-providers",
+            storageDirectory: "rule",
+            profileID: profileID
+        )
+        try rejectFileBackedProxyCredentials()
+    }
+
+    private mutating func rewriteHTTPProviderStorage(
+        key: String,
+        storageDirectory: String,
+        profileID: String
+    ) throws {
+        guard let rawProviders = mapping[key] else { return }
+        guard let providers = rawProviders as? [String: Any] else {
+            throw KumoError.invalidArguments("The runtime requires a valid \(key) mapping.")
+        }
+
+        var rewritten = providers
+        for entry in providers {
+            guard var provider = entry.value as? [String: Any],
+                  let rawType = provider["type"] as? String,
+                  rawType.lowercased() == "http" else {
+                continue
+            }
+            let rawURL = try validatedRemoteProviderURL(provider["url"], key: key)
+            provider["path"] = try Self.providerStoragePath(
+                profileID: profileID,
+                providerKey: entry.key,
+                providerURL: rawURL,
+                storageDirectory: storageDirectory
+            )
+            rewritten[entry.key] = provider
+        }
+        mapping[key] = rewritten
+    }
+
+    private mutating func sanitizeProviders(
+        key: String,
+        storageDirectory: String,
+        profileID: String
+    ) throws {
+        guard let rawProviders = mapping[key] else { return }
+        guard let providers = rawProviders as? [String: Any] else {
+            throw KumoError.invalidArguments("The privileged runtime requires a valid \(key) mapping.")
+        }
+
+        var sanitized: [String: Any] = [:]
+        for entry in providers {
+            guard var provider = entry.value as? [String: Any],
+                  let rawType = provider["type"] as? String else {
+                throw KumoError.invalidArguments("The privileged runtime requires typed \(key) entries.")
+            }
+            let type = rawType.lowercased()
+            switch type {
+            case "http":
+                let rawURL = try validatedRemoteProviderURL(provider["url"], key: key)
+                provider["path"] = try Self.providerStoragePath(
+                    profileID: profileID,
+                    providerKey: entry.key,
+                    providerURL: rawURL,
+                    storageDirectory: storageDirectory
+                )
+            case "inline":
+                provider.removeValue(forKey: "path")
+            case "file":
+                throw KumoError.invalidArguments("Local file providers are not available in privileged mode.")
+            default:
+                throw KumoError.invalidArguments("The privileged runtime does not support this provider type.")
+            }
+            provider.removeValue(forKey: "path-in-bundle")
+            provider.removeValue(forKey: "age-secret-key")
+            sanitized[entry.key] = provider
+        }
+        mapping[key] = sanitized
+    }
+
+    private func validatedRemoteProviderURL(_ value: Any?, key: String) throws -> String {
+        guard let rawURL = value as? String,
+              rawURL.utf8.count <= 4_096,
+              !rawURL.unicodeScalars.contains(where: { $0.value == 0 }),
+              let components = URLComponents(string: rawURL),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host != nil else {
+            throw KumoError.invalidArguments("The runtime requires remote \(key) URLs.")
+        }
+        return rawURL
+    }
+
+    private static func providerStoragePath(
+        profileID: String,
+        providerKey: String,
+        providerURL: String,
+        storageDirectory: String
+    ) throws -> String {
+        let profileID = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !profileID.isEmpty,
+              profileID.utf8.count <= 4_096,
+              !profileID.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw KumoError.invalidArguments("The profile identifier cannot namespace provider storage.")
+        }
+        let profileNamespace = stableDigest(fields: ["profile", profileID])
+        let providerIdentity = stableDigest(fields: ["provider", providerKey, providerURL])
+        return "./providers/\(storageDirectory)/\(profileNamespace)/\(providerIdentity).yaml"
+    }
+
+    private static func stableDigest(fields: [String]) -> String {
+        var hasher = SHA256()
+        for field in fields {
+            var length = UInt64(field.utf8.count).bigEndian
+            withUnsafeBytes(of: &length) { bytes in
+                hasher.update(data: Data(bytes))
+            }
+            hasher.update(data: Data(field.utf8))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func rejectFileBackedProxyCredentials() throws {
+        guard let rawProxies = mapping["proxies"] else { return }
+        guard let proxies = rawProxies as? [Any] else {
+            throw KumoError.invalidArguments("The privileged runtime requires a valid proxies sequence.")
+        }
+        let fileBackedKeys: Set<String> = [
+            "certificate",
+            "private-key",
+            "private_key",
+            "client-certificate",
+            "client-key"
+        ]
+        for proxy in proxies {
+            guard let proxy = proxy as? [String: Any] else {
+                throw KumoError.invalidArguments("The privileged runtime requires valid proxy entries.")
+            }
+            if !fileBackedKeys.isDisjoint(with: proxy.keys) {
+                throw KumoError.invalidArguments(
+                    "File-backed proxy credentials are not available in privileged mode."
+                )
+            }
         }
     }
 

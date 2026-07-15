@@ -102,6 +102,71 @@ final class MihomoControllerClientTests: XCTestCase {
         XCTAssertEqual(connections.first?.chain, ["Proxy", "HK"])
     }
 
+    func testRuntimeMutationsMapToExpectedMihomoRoutes() async throws {
+        let lock = NSLock()
+        nonisolated(unsafe) var received: [(method: String, path: String, body: Data?)] = []
+        MockURLProtocol.requestHandler = { request in
+            lock.withLock {
+                received.append((
+                    request.httpMethod ?? "",
+                    request.url?.path ?? "",
+                    request.bodyData
+                ))
+            }
+            let data: Data
+            if request.httpMethod == "GET", request.url?.path == "/configs" {
+                data = Data(#"{"mode":"direct"}"#.utf8)
+            } else {
+                data = Data("{}".utf8)
+            }
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                data
+            )
+        }
+        let client = MihomoControllerClient(session: mockSession())
+
+        try await client.apply(.setMode(.direct))
+        try await client.apply(.selectProxy(group: "Proxy", name: "Node B"))
+        try await client.apply(.setRuleEnabled(index: 7, isEnabled: false))
+        try await client.apply(.closeConnection(id: "connection-1"))
+        try await client.apply(.closeConnections(matchingProxy: nil))
+        try await client.apply(.updateProxyProvider(name: "provider-a"))
+        try await client.apply(.updateRuleProvider(name: "rules-a"))
+        try await client.apply(.upgradeGeoData)
+
+        XCTAssertEqual(
+            lock.withLock { received.map { "\($0.method) \($0.path)" } },
+            [
+                "PATCH /configs",
+                "GET /configs",
+                "PUT /proxies/Proxy",
+                "PATCH /rules/disable",
+                "DELETE /connections/connection-1",
+                "DELETE /connections",
+                "PUT /providers/proxies/provider-a",
+                "PUT /providers/rules/rules-a",
+                "POST /upgrade/geo"
+            ]
+        )
+        let routed = lock.withLock { received }
+        let selectionBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(routed[2].body))
+                as? [String: String]
+        )
+        XCTAssertEqual(selectionBody, ["name": "Node B"])
+        let ruleBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(routed[3].body))
+                as? [String: Bool]
+        )
+        XCTAssertEqual(ruleBody, ["7": true])
+    }
+
     private func mockSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]

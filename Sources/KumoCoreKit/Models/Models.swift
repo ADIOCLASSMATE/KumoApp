@@ -439,12 +439,25 @@ public struct TunSettings: Codable, Equatable, Sendable {
     }
 }
 
+public enum ServiceInstallationHealth: String, Codable, Equatable, Sendable {
+    case absent
+    case legacyComplete
+    case current
+    case partial
+    case foreignUser
+    case unsafe
+}
+
 public struct ServiceModeStatus: Codable, Equatable, Sendable {
     public var isInstalled: Bool
     public var isRunning: Bool
     public var isAvailable: Bool
     public var isCurrentProcessPrivileged: Bool
     public var socketPath: String
+    public var installationHealth: ServiceInstallationHealth?
+    public var helperProtocolVersion: Int?
+    public var helperVersion: String?
+    public var helperCapabilities: [KumoServiceCapability]?
     public var message: String?
 
     public init(
@@ -453,6 +466,10 @@ public struct ServiceModeStatus: Codable, Equatable, Sendable {
         isAvailable: Bool = false,
         isCurrentProcessPrivileged: Bool = false,
         socketPath: String = "",
+        installationHealth: ServiceInstallationHealth? = nil,
+        helperProtocolVersion: Int? = nil,
+        helperVersion: String? = nil,
+        helperCapabilities: [KumoServiceCapability]? = nil,
         message: String? = nil
     ) {
         self.isInstalled = isInstalled
@@ -460,11 +477,28 @@ public struct ServiceModeStatus: Codable, Equatable, Sendable {
         self.isAvailable = isAvailable
         self.isCurrentProcessPrivileged = isCurrentProcessPrivileged
         self.socketPath = socketPath
+        self.installationHealth = installationHealth
+        self.helperProtocolVersion = helperProtocolVersion
+        self.helperVersion = helperVersion
+        self.helperCapabilities = helperCapabilities
         self.message = message
     }
 
     public var canManageTun: Bool {
         isAvailable || isCurrentProcessPrivileged
+    }
+
+    public var requiresRepair: Bool {
+        switch installationHealth {
+        case .legacyComplete, .partial, .foreignUser, .unsafe:
+            true
+        case .current:
+            !isAvailable
+        case .absent:
+            isInstalled || isRunning
+        case nil:
+            isInstalled && !isAvailable
+        }
     }
 }
 
@@ -547,6 +581,7 @@ public struct SystemProxySnapshot: Codable, Equatable, Sendable {
     public var secureWebProxy: String
     public var socksProxy: String
     public var bypassDomains: String
+    public var autoProxy: String?
 
     public init(
         networkService: String,
@@ -554,7 +589,8 @@ public struct SystemProxySnapshot: Codable, Equatable, Sendable {
         webProxy: String = "",
         secureWebProxy: String = "",
         socksProxy: String = "",
-        bypassDomains: String = ""
+        bypassDomains: String = "",
+        autoProxy: String? = nil
     ) {
         self.networkService = networkService
         self.capturedAt = capturedAt
@@ -562,7 +598,14 @@ public struct SystemProxySnapshot: Codable, Equatable, Sendable {
         self.secureWebProxy = secureWebProxy
         self.socksProxy = socksProxy
         self.bypassDomains = bypassDomains
+        self.autoProxy = autoProxy
     }
+}
+
+public enum SystemProxyRecoveryAction: String, Codable, Equatable, Sendable {
+    /// A disable transaction was durably staged but not committed. Helper
+    /// startup must finish/verify the restore and must never re-enable Kumo.
+    case completeDisable
 }
 
 public struct CoreStatus: Codable, Equatable, Sendable {
@@ -576,9 +619,17 @@ public struct CoreStatus: Codable, Equatable, Sendable {
     public var runtimeSettings: CoreRuntimeSettings?
     public var systemProxySettings: SystemProxySettings?
     public var previousSystemProxySnapshot: SystemProxySnapshot?
+    /// Exact macOS proxy state last committed by Kumo. This is compared
+    /// before restore so Kumo never overwrites a newer change made by the
+    /// user or another proxy application.
+    public var appliedSystemProxySnapshot: SystemProxySnapshot?
+    public var systemProxyRecoveryAction: SystemProxyRecoveryAction?
     public var serviceModeStatus: ServiceModeStatus?
     public var tunStatus: TunStatus?
     public var readiness: CoreReadiness?
+    public var activeProfileID: String?
+    public var runtimeGeneration: UUID?
+    public var configurationDigest: String?
     public var message: String?
 
     public init(
@@ -592,9 +643,14 @@ public struct CoreStatus: Codable, Equatable, Sendable {
         runtimeSettings: CoreRuntimeSettings? = nil,
         systemProxySettings: SystemProxySettings? = nil,
         previousSystemProxySnapshot: SystemProxySnapshot? = nil,
+        appliedSystemProxySnapshot: SystemProxySnapshot? = nil,
+        systemProxyRecoveryAction: SystemProxyRecoveryAction? = nil,
         serviceModeStatus: ServiceModeStatus? = nil,
         tunStatus: TunStatus? = nil,
         readiness: CoreReadiness? = nil,
+        activeProfileID: String? = nil,
+        runtimeGeneration: UUID? = nil,
+        configurationDigest: String? = nil,
         message: String? = nil
     ) {
         self.state = state
@@ -607,10 +663,27 @@ public struct CoreStatus: Codable, Equatable, Sendable {
         self.runtimeSettings = runtimeSettings
         self.systemProxySettings = systemProxySettings
         self.previousSystemProxySnapshot = previousSystemProxySnapshot
+        self.appliedSystemProxySnapshot = appliedSystemProxySnapshot
+        self.systemProxyRecoveryAction = systemProxyRecoveryAction
         self.serviceModeStatus = serviceModeStatus
         self.tunStatus = tunStatus
         self.readiness = readiness
+        self.activeProfileID = activeProfileID
+        self.runtimeGeneration = runtimeGeneration
+        self.configurationDigest = configurationDigest
         self.message = message
+    }
+
+    public var isStrictlyStoppedProcessState: Bool {
+        state == .stopped
+            && pid == nil
+            && runtimeGeneration == nil
+            && readiness == nil
+    }
+
+    public var isStrictlyStoppedRuntime: Bool {
+        isStrictlyStoppedProcessState
+            && !systemProxyEnabled
     }
 }
 
@@ -1072,6 +1145,7 @@ public struct OverrideItem: Identifiable, Codable, Equatable, Sendable {
     public var format: OverrideFormat
     public var updatedAt: Date
     public var isGlobal: Bool
+    public var profileID: String?
     public var remoteURL: URL?
     public var fingerprint: String?
 
@@ -1082,6 +1156,7 @@ public struct OverrideItem: Identifiable, Codable, Equatable, Sendable {
         format: OverrideFormat = .yaml,
         updatedAt: Date = Date(),
         isGlobal: Bool = false,
+        profileID: String? = nil,
         remoteURL: URL? = nil,
         fingerprint: String? = nil
     ) {
@@ -1091,6 +1166,7 @@ public struct OverrideItem: Identifiable, Codable, Equatable, Sendable {
         self.format = format
         self.updatedAt = updatedAt
         self.isGlobal = isGlobal
+        self.profileID = profileID
         self.remoteURL = remoteURL
         self.fingerprint = fingerprint
     }

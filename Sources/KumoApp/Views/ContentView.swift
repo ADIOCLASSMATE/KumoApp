@@ -242,7 +242,7 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 if store.status.state == .running {
-                    store.stopCore()
+                    Task { await store.stopCore() }
                 } else {
                     Task { await store.startCore() }
                 }

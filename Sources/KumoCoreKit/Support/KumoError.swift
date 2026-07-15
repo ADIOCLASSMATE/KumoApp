@@ -8,6 +8,7 @@ public enum KumoError: LocalizedError, Equatable {
     case unsupportedProfileSource
     case controllerResponse(Int, String)
     case commandFailed(String)
+    case runtimeGenerationConflict
     case coreInstallFailed(String)
     case serviceUnavailable(String)
     case agentSkillsFailed(String)
@@ -28,6 +29,8 @@ public enum KumoError: LocalizedError, Equatable {
             "Controller returned HTTP \(status): \(body)"
         case .commandFailed(let message):
             message
+        case .runtimeGenerationConflict:
+            "The runtime generation changed before the requested operation could be committed."
         case .coreInstallFailed(let message):
             "Core installation failed: \(message)"
         case .serviceUnavailable(let message):

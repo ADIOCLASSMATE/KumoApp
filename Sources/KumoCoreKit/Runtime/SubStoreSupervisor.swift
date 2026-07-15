@@ -64,9 +64,8 @@ public actor SubStoreSupervisor {
 
     /// Stop the supervised process if it is running.
     public func stop() {
-        if let process, process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
+        if let process {
+            BoundedChildProcessTerminator.stop(process)
         }
         process = nil
         try? logHandle?.close()
